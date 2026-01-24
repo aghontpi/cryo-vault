@@ -1,0 +1,4 @@
+{"type": "session_start", "session_id": "stream-test-1", "title": "Stream Test", "created_at": 1700000000}
+{"type": "message", "session_id": "stream-test-1", "message": {"role": "user", "content": "Is streaming working?"}}
+{"type": "message", "session_id": "stream-test-1", "message": {"role": "assistant", "content": "Yes, streaming is working perfectly!"}}
+{"type": "finalize", "session_id": "stream-test-1"}

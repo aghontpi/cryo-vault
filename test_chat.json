@@ -1,0 +1,19 @@
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "title": "Debugging Rust Macros",
+  "source": "vscode-mcp-logger",
+  "model": "claude-3-opus",
+  "created_at": 1704067200,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Why is this macro failing?",
+      "timestamp": 1704067205
+    },
+    {
+      "role": "assistant",
+      "content": "It looks like a hygiene issue...",
+      "timestamp": 1704067210
+    }
+  ]
+}
