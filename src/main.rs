@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::NaiveDate;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, crate_authors};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
@@ -11,10 +11,11 @@ use cryo_vault::storage::Storage;
 
 #[derive(Parser)]
 #[command(name = "cryo")]
+#[command(author = crate_authors!("\n"))]
 #[command(version)]
 #[command(
-    about = "High-performance AI Log Archiver",
-    long_about = "High-performance AI Log Archiver\n\nLogging:\n  Control logging verbosity using the RUST_LOG environment variable.\n  Levels: trace, debug, info, warn, error\n  Default: warn\n  Example: RUST_LOG=debug cryo add session.json"
+    about = "High-performance AI Conversations Database",
+    long_about = "High-performance AI Conversations Database\n\nLogging:\n  Control logging verbosity using the RUST_LOG environment variable.\n  Levels: trace, debug, info, warn, error\n  Default: warn\n  Example: RUST_LOG=debug cryo add session.json"
 )]
 struct Cli {
     /// Override database path (Default: ~/.cryo)
@@ -85,6 +86,17 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Optimise database into ~256KB compressed blocks
+    Optimise {
+        /// Target compressed block size in KB
+        #[arg(long, default_value = "256")]
+        chunk_kb: usize,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Parse date string (YYYY-MM-DD) or Unix timestamp
@@ -127,6 +139,19 @@ fn print_session_list(sessions: &[ChatSessionV1]) {
         }
         println!();
     }
+}
+
+fn make_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len.max(1));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb
 }
 
 /// Helper function to display first or last N sessions
@@ -224,15 +249,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
             "Detected ChatGPT export format. Importing {} conversations...",
             count
         );
-        let pb = ProgressBar::new(count as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+        let pb = make_progress_bar(count as u64);
 
         let mut writer = storage.get_writer()?;
         for conv in conversations {
@@ -257,11 +274,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
         Ok(sessions) => {
             let count = sessions.len();
             println!("Importing {} sessions...", count);
-            let pb = ProgressBar::new(count as u64);
-            pb.set_style(ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .unwrap()
-                .progress_chars("#>-"));
+            let pb = make_progress_bar(count as u64);
 
             let mut writer = storage.get_writer()?;
             for input in sessions {
@@ -428,6 +441,49 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Handles the 'optimise' command
+fn handle_optimise(db_path: PathBuf, chunk_kb: usize, yes: bool) -> Result<()> {
+    let _lock = CryoLock::acquire(&db_path, 5000)?;
+
+    if chunk_kb == 0 {
+        return Err(anyhow::anyhow!("chunk_kb must be greater than 0"));
+    }
+
+    if !yes {
+        println!("This will rewrite your data and index files.");
+        println!("A new block size of ~{} KB will be used.", chunk_kb);
+        print!("Continue? (y/N): ");
+        io::Write::flush(&mut io::stdout())?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let storage = Storage::new(db_path.clone());
+    let target_bytes = chunk_kb * 1024;
+    let stats = storage.get_stats()?;
+    let total_sessions = stats.session_count as u64;
+
+    let pb = make_progress_bar(total_sessions);
+
+    let (blocks, sessions) = storage.optimise_with_progress(target_bytes, |inc| {
+        pb.inc(inc as u64);
+    })?;
+
+    pb.finish_with_message("Optimise complete");
+
+    println!(
+        "Optimised {} sessions into {} blocks (~{} KB target).",
+        sessions, blocks, chunk_kb
+    );
+    Ok(())
+}
+
 /// Main entry point for the Cryo CLI.
 /// Handles command parsing and dispatching to appropriate storage operations.
 fn main() -> Result<()> {
@@ -461,6 +517,7 @@ fn main() -> Result<()> {
         Commands::Last { count } => handle_last(db_path, count)?,
         Commands::Show { session_id } => handle_show(db_path, session_id)?,
         Commands::Reindex { yes } => handle_reindex(db_path, yes)?,
+        Commands::Optimise { chunk_kb, yes } => handle_optimise(db_path, chunk_kb, yes)?,
     }
 
     Ok(())

@@ -2,12 +2,13 @@
 name = "cryo-vault"
 version = "0.1.0"
 edition = "2024"
+authors = ["Bluepie <iambluepie@gmail.com>"]
 
 [dependencies]
 anyhow = "1.0.100"
 bincode = "1.3"
 chrono = { version = "0.4.43", features = ["serde"] }
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.5.54", features = ["derive", "env", "cargo"] }
 dirs = "6.0.0"
 fastbloom = { version = "0.14.1", features = ["serde"] }
 fs2 = "0.4.3"

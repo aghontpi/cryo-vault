@@ -8,7 +8,14 @@ use uuid::Uuid;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum StoredSession {
     V1(ChatSessionV1),
+    V2(SessionBlockV2),
     // Future: V2(ChatSessionV2)
+}
+
+/// Chunked block containing multiple sessions.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionBlockV2 {
+    pub sessions: Vec<ChatSessionV1>,
 }
 
 /// The Input DTO (V1).
