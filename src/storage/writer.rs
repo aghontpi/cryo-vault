@@ -1,4 +1,4 @@
-use crate::schema::{ChatSessionV1, StoredSession, StreamEvent};
+use crate::schema::{StoredSession, StreamEvent};
 use crate::storage::constants::DATA_MAGIC;
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
@@ -46,7 +46,7 @@ impl SessionWriter {
     /// - Creating and writing the index entry (with Bloom filter data).
     ///
     /// The offset is tracked manually since we are using buffered writers.
-    pub fn append(&mut self, session: ChatSessionV1) -> Result<()> {
+    pub fn append(&mut self, wrapper: StoredSession) -> Result<()> {
         // Data Rotation Check
         if self.current_size >= self.max_size {
             debug!(
@@ -57,7 +57,6 @@ impl SessionWriter {
             self.rotate()?;
         }
 
-        let wrapper = StoredSession::V1(session.clone());
         let raw_bytes = bincode::serialize(&wrapper).context("Failed to serialize session")?;
         // Level 19 for maximum archival compression
         let compressed_bytes =
@@ -72,35 +71,79 @@ impl SessionWriter {
         let written_bytes = 4 + compressed_bytes.len() as u64;
         self.current_size += written_bytes;
 
-        let mut full_text = String::new();
-        for msg in &session.messages {
-            full_text.push_str(&msg.content);
-            full_text.push(' ');
-        }
+        let index_entry = match &wrapper {
+            StoredSession::V1(session) => {
+                let full_text = session.extract_full_text();
 
-        let min_time = session.created_at.unwrap_or(0);
-        let max_time = session.created_at.unwrap_or(u64::MAX);
+                let min_time = session.created_at.unwrap_or(0);
+                let max_time = session.created_at.unwrap_or(u64::MAX);
 
-        let index_entry = crate::index::BlockIndex::new(
-            session.id.clone(),
-            crate::index::BlockIndexParams {
-                content: &full_text,
-                min_time,
-                max_time,
-                data_offset,
-                compressed_size,
-                uncompressed_size: raw_bytes.len() as u32,
-                message_count: session.messages.len() as u32,
-            },
-        );
+                crate::index::BlockIndex::new(
+                    session.id.clone(),
+                    crate::index::BlockIndexParams {
+                        content: &full_text,
+                        min_time,
+                        max_time,
+                        data_offset,
+                        compressed_size,
+                        uncompressed_size: raw_bytes.len() as u32,
+                        message_count: session.messages.len() as u32,
+                    },
+                )
+            }
+            StoredSession::Block(sessions) => {
+                let mut full_text = String::new();
+                let mut min_time = u64::MAX;
+                let mut max_time = 0;
+                let mut message_count = 0;
+                let mut session_ids = Vec::new();
+
+                for session in sessions {
+                    session_ids.push(session.id.clone());
+                    full_text.push_str(&session.extract_full_text());
+                    let created = session.created_at.unwrap_or(0);
+                    if created < min_time {
+                        min_time = created;
+                    }
+                    if created > max_time {
+                        max_time = created;
+                    }
+                    message_count += session.messages.len() as u32;
+                }
+                if min_time == u64::MAX {
+                    min_time = 0;
+                }
+
+                crate::index::BlockIndex::new(
+                    session_ids.join(","),
+                    crate::index::BlockIndexParams {
+                        content: &full_text,
+                        min_time,
+                        max_time,
+                        data_offset,
+                        compressed_size,
+                        uncompressed_size: raw_bytes.len() as u32,
+                        message_count,
+                    },
+                )
+            }
+        };
+
         let index_bytes = bincode::serialize(&index_entry)?;
         let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
 
         let idx_size = compressed_index.len() as u32;
         self.index_writer.write_all(&idx_size.to_le_bytes())?;
         self.index_writer.write_all(&compressed_index)?;
-
-        trace!(session_id = %session.id, compressed_size, "Session written to storage");
+        let count = match &wrapper {
+            StoredSession::V1(_) => 1,
+            StoredSession::Block(sessions) => sessions.len(),
+        };
+        trace!(
+            compressed_size,
+            session_count = count,
+            "Session(s) written to storage"
+        );
         Ok(())
     }
 

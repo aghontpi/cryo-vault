@@ -319,7 +319,9 @@ fn test_cli_add_chatgpt_export() {
         .write_stdin(export)
         .assert()
         .success()
-        .stdout(predicate::str::contains("Imported ChatGPT export"));
+        .stdout(predicate::str::contains(
+            "Imported 1 ChatGPT conversations to",
+        ));
 
     // Verify it exists
     cryo_command(&db_path)

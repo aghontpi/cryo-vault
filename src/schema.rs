@@ -8,7 +8,8 @@ use uuid::Uuid;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum StoredSession {
     V1(ChatSessionV1),
-    // Future: V2(ChatSessionV2)
+    Block(Vec<ChatSessionV1>),
+    // Future: V3
 }
 
 /// The Input DTO (V1).
@@ -85,6 +86,17 @@ impl From<ChatSessionInput> for ChatSessionV1 {
             metadata_json: serde_json::to_string(&input.metadata).unwrap_or_default(),
             messages: input.messages.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+impl ChatSessionV1 {
+    pub fn extract_full_text(&self) -> String {
+        let mut full_text = String::new();
+        for msg in &self.messages {
+            full_text.push_str(&msg.content);
+            full_text.push(' ');
+        }
+        full_text
     }
 }
 

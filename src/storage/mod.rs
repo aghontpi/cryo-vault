@@ -17,7 +17,7 @@ use tracing::{debug, trace};
 
 use crate::schema::{ChatSessionInput, ChatSessionV1, StoredSession, StreamEvent};
 use constants::{DATA_MAGIC, MAX_FILE_SIZE};
-pub use types::DbStats;
+pub use types::{DbStats, StorageError};
 pub use writer::{SessionWriter, WalWriter};
 
 pub struct Storage {
@@ -123,7 +123,7 @@ impl Storage {
         let session_id = session.id.clone();
         trace!(session_id = %session_id, "Appending session to storage");
         let mut writer = self.get_writer()?;
-        writer.append(session)?;
+        writer.append(StoredSession::V1(session))?;
         writer.flush()?;
         debug!(session_id = %session_id, "Session appended successfully");
         Ok(())
@@ -141,6 +141,92 @@ impl Storage {
             .context("Failed to open pending file")?;
 
         Ok(WalWriter::new(file))
+    }
+
+    /// Appends a large batch of sessions directly to the main storage file,
+    /// bypassing the WAL buffer entirely. This is highly optimized for bulk imports.
+    pub fn append_bulk(&self, sessions: Vec<ChatSessionV1>) -> Result<usize> {
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = self.get_writer()?;
+        let total_count = sessions.len();
+
+        // We chunk the array to prevent memory spikes in ZSTD compression
+        // 100 sessions per block is a reasonable tradeoff for search vs compression
+        for chunk in sessions.chunks(100) {
+            let block = StoredSession::Block(chunk.to_vec());
+            writer.append(block)?;
+        }
+
+        writer.flush()?;
+        debug!(
+            count = total_count,
+            "Successfully bulk-appended sessions to main storage"
+        );
+
+        Ok(total_count)
+    }
+
+    /// Appends a session directly to the WAL buffer and triggers a flush if > 256KB
+    pub fn append_pending(&self, session: ChatSessionV1) -> Result<()> {
+        let mut wal = self.get_wal_writer()?;
+
+        let mut metadata: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&session.metadata_json).unwrap_or_default();
+
+        if let Some(t) = &session.title {
+            metadata.insert("title".to_string(), serde_json::Value::String(t.clone()));
+        }
+        if let Some(s) = &session.source {
+            metadata.insert("source".to_string(), serde_json::Value::String(s.clone()));
+        }
+        if let Some(m) = &session.model {
+            metadata.insert("model".to_string(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(c) = session.created_at {
+            metadata.insert(
+                "created_at".to_string(),
+                serde_json::Value::Number(c.into()),
+            );
+        }
+
+        wal.append(StreamEvent::SessionStart {
+            session_id: session.id.clone(),
+            metadata,
+        })?;
+
+        for msg in session.messages {
+            let msg_input = crate::schema::MessageInput {
+                role: msg.role,
+                content: msg.content,
+                tool_calls: msg.tool_calls,
+                tool_outputs: msg.tool_outputs,
+                id: msg.id,
+                parent_id: msg.parent_id,
+                metadata: serde_json::from_str(&msg.metadata_json).unwrap_or_default(),
+            };
+            wal.append(StreamEvent::AppendMessage {
+                session_id: session.id.clone(),
+                message: msg_input,
+            })?;
+        }
+
+        wal.append(StreamEvent::Finalize {
+            session_id: session.id,
+        })?;
+
+        wal.flush()?;
+
+        // Trigger auto-flush if > 256KB
+        let len = fs::metadata(self.get_pending_file())?.len();
+        if len > 256 * 1024 {
+            let count = self.flush_pending()?;
+            debug!(count, "Auto-flushed buffer to single block.");
+        }
+
+        Ok(())
     }
 
     /// Read pending.bin, aggregate complete sessions, write to .cryo, compact pending.bin
@@ -213,20 +299,32 @@ impl Storage {
         }
 
         let mut archived_count = 0;
+        let mut sessions_to_block = Vec::new();
 
         for id in &finalized_ids {
             // Only process if it was built from parts (exists in map)
             if let Some(input) = session_map.remove(id) {
-                // IDEMPOTENCY CHECK: Skip if already exists
-                if self.get_session_by_id(id)?.is_some() {
+                // IDEMPOTENCY CHECK: Skip if already exists in the archive
+                if self.get_archived_session_by_id(id)?.is_some() {
                     debug!(session_id = %id, "Session already archived, skipping");
                     continue;
                 }
 
                 let session_v1: ChatSessionV1 = input.into();
-                self.append_session(session_v1)?;
+                sessions_to_block.push(session_v1);
                 archived_count += 1;
             }
+        }
+
+        if !sessions_to_block.is_empty() {
+            let mut writer = self.get_writer()?;
+            let wrapper = if sessions_to_block.len() == 1 {
+                StoredSession::V1(sessions_to_block.pop().unwrap())
+            } else {
+                StoredSession::Block(sessions_to_block)
+            };
+            writer.append(wrapper)?;
+            writer.flush()?;
         }
 
         let mut new_pending_events = Vec::new();
@@ -261,6 +359,98 @@ impl Storage {
         Ok(archived_count)
     }
 
+    /// Reads all completed sessions currently in the pending WAL buffer.
+    pub fn get_pending_sessions(&self) -> Result<Vec<ChatSessionV1>> {
+        let pending_path = self.get_pending_file();
+        if !pending_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut file = File::open(&pending_path)?;
+        let mut events = Vec::new();
+        loop {
+            let mut size_buf = [0u8; 4];
+            let n = file.read(&mut size_buf)?;
+            if n == 0 {
+                break;
+            }
+            if n < 4 {
+                file.read_exact(&mut size_buf[n..])?;
+            }
+            let size = u32::from_le_bytes(size_buf) as usize;
+            let mut buf = vec![0u8; size];
+            file.read_exact(&mut buf)?;
+
+            events.push(serde_json::from_slice::<StreamEvent>(&buf)?);
+        }
+
+        let mut session_map: HashMap<String, ChatSessionInput> = HashMap::new();
+        let mut finalized_ids = Vec::new();
+
+        for event in &events {
+            match event {
+                StreamEvent::SessionStart {
+                    session_id,
+                    metadata,
+                } => {
+                    let title = metadata
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let source = metadata
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let model = metadata
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let created_at = metadata.get("created_at").and_then(|v| v.as_u64());
+
+                    let mut clean_metadata = metadata.clone();
+                    clean_metadata.remove("title");
+                    clean_metadata.remove("source");
+                    clean_metadata.remove("model");
+                    clean_metadata.remove("created_at");
+
+                    session_map
+                        .entry(session_id.clone())
+                        .or_insert_with(|| ChatSessionInput {
+                            id: Some(session_id.clone()),
+                            title,
+                            source,
+                            model,
+                            created_at,
+                            metadata: clean_metadata,
+                            messages: Vec::new(),
+                        });
+                }
+                StreamEvent::AppendMessage {
+                    session_id,
+                    message,
+                } => {
+                    if let Some(session) = session_map.get_mut(session_id) {
+                        session.messages.push(message.clone());
+                    }
+                }
+                StreamEvent::Finalize { session_id } => {
+                    if session_map.contains_key(session_id) {
+                        finalized_ids.push(session_id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        for id in &finalized_ids {
+            if let Some(input) = session_map.remove(id) {
+                results.push(input.into());
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Searches the archive using the Index for filtering.
     ///
     /// Iterates through blocks and index entries in sync.
@@ -277,6 +467,39 @@ impl Storage {
         let index_path = self.get_index_file();
 
         let mut results = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        // 1. Search Pending Buffer First
+        if let Ok(pending_sessions) = self.get_pending_sessions() {
+            for s in pending_sessions {
+                if let Some(after_ts) = after {
+                    if let Some(ct) = s.created_at {
+                        if ct < after_ts {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(before_ts) = before {
+                    if let Some(ct) = s.created_at {
+                        if ct > before_ts {
+                            continue;
+                        }
+                    }
+                }
+
+                let mut found = false;
+                for msg in &s.messages {
+                    if msg.content.to_lowercase().contains(&query.to_lowercase()) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    seen_ids.insert(s.id.clone());
+                    results.push(s);
+                }
+            }
+        }
 
         if !path.exists() {
             return Ok(results);
@@ -347,8 +570,24 @@ impl Storage {
                                 break;
                             }
                         }
-                        if found {
+                        if found && !seen_ids.contains(&s.id) {
+                            seen_ids.insert(s.id.clone());
                             results.push(s);
+                        }
+                    }
+                    StoredSession::Block(sessions) => {
+                        for s in sessions {
+                            let mut found = false;
+                            for msg in &s.messages {
+                                if msg.content.to_lowercase().contains(&query.to_lowercase()) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if found && !seen_ids.contains(&s.id) {
+                                seen_ids.insert(s.id.clone());
+                                results.push(s);
+                            }
                         }
                     }
                 }
@@ -366,12 +605,21 @@ impl Storage {
     /// Checks magic bytes and iterates through all blocks in the file.
     pub fn scan_all(&self) -> Result<Vec<ChatSessionV1>> {
         let path = self.get_active_file();
+        let mut sessions = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        if let Ok(pending) = self.get_pending_sessions() {
+            for s in pending {
+                seen_ids.insert(s.id.clone());
+                sessions.push(s);
+            }
+        }
+
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(sessions);
         }
 
         let mut file = File::open(&path)?;
-        let mut sessions = Vec::new();
 
         let mut magic_buf = [0u8; 8];
         file.read_exact(&mut magic_buf)?;
@@ -402,7 +650,20 @@ impl Storage {
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
             match wrapper {
-                StoredSession::V1(s) => sessions.push(s),
+                StoredSession::V1(s) => {
+                    if !seen_ids.contains(&s.id) {
+                        seen_ids.insert(s.id.clone());
+                        sessions.push(s);
+                    }
+                }
+                StoredSession::Block(block_sessions) => {
+                    for s in block_sessions {
+                        if !seen_ids.contains(&s.id) {
+                            seen_ids.insert(s.id.clone());
+                            sessions.push(s);
+                        }
+                    }
+                }
             }
         }
 
@@ -411,6 +672,19 @@ impl Storage {
 
     /// Get a single session by ID using the index (O(1) lookup)
     pub fn get_session_by_id(&self, session_id: &str) -> Result<Option<ChatSessionV1>> {
+        // 1. Check pending first
+        if let Ok(pending) = self.get_pending_sessions() {
+            if let Some(s) = pending.into_iter().find(|s| s.id == session_id) {
+                return Ok(Some(s));
+            }
+        }
+
+        // 2. Check Archive
+        self.get_archived_session_by_id(session_id)
+    }
+
+    /// Internal helper that checks only the persistent archive files, skipping pending.bin
+    fn get_archived_session_by_id(&self, session_id: &str) -> Result<Option<ChatSessionV1>> {
         let path = self.get_active_file();
         let index_path = self.get_index_file();
 
@@ -445,7 +719,7 @@ impl Storage {
             let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
             let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
 
-            if index.session_id == session_id {
+            if index.session_id.split(',').any(|id| id == session_id) {
                 // Found it! Now read the specific block
                 let mut data_file = File::open(&path)?;
 
@@ -466,7 +740,16 @@ impl Storage {
                 let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
                 return match wrapper {
-                    StoredSession::V1(s) => Ok(Some(s)),
+                    StoredSession::V1(s) => {
+                        if s.id == session_id {
+                            Ok(Some(s))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    StoredSession::Block(sessions) => {
+                        Ok(sessions.into_iter().find(|s| s.id == session_id))
+                    }
                 };
             }
         }
@@ -488,7 +771,7 @@ impl Storage {
         let temp_index_path = index_path.with_extension("cryo.tmp");
 
         if !path.exists() {
-            return Err(anyhow::anyhow!("Data file not found"));
+            return Err(StorageError::DataFileNotFound.into());
         }
 
         let mut file = File::open(&path)?;
@@ -534,11 +817,7 @@ impl Storage {
             match wrapper {
                 StoredSession::V1(session) => {
                     // Extract content
-                    let mut full_text = String::new();
-                    for msg in &session.messages {
-                        full_text.push_str(&msg.content);
-                        full_text.push(' ');
-                    }
+                    let full_text = session.extract_full_text();
 
                     let min_time = session.created_at.unwrap_or(0);
                     let max_time = session.created_at.unwrap_or(u64::MAX);
@@ -565,6 +844,51 @@ impl Storage {
 
                     count += 1;
                 }
+                StoredSession::Block(sessions) => {
+                    let mut full_text = String::new();
+                    let mut min_time = u64::MAX;
+                    let mut max_time = 0;
+                    let mut message_count = 0;
+                    let mut session_ids = Vec::new();
+
+                    for session in &sessions {
+                        session_ids.push(session.id.clone());
+                        full_text.push_str(&session.extract_full_text());
+
+                        let created = session.created_at.unwrap_or(0);
+                        if created < min_time {
+                            min_time = created;
+                        }
+                        if created > max_time {
+                            max_time = created;
+                        }
+                        message_count += session.messages.len() as u32;
+                    }
+                    if min_time == u64::MAX {
+                        min_time = 0;
+                    }
+
+                    let index_entry = crate::index::BlockIndex::new(
+                        session_ids.join(","),
+                        crate::index::BlockIndexParams {
+                            content: &full_text,
+                            min_time,
+                            max_time,
+                            data_offset,
+                            compressed_size,
+                            uncompressed_size: raw_bytes.len() as u32,
+                            message_count,
+                        },
+                    );
+
+                    let index_bytes = bincode::serialize(&index_entry)?;
+                    let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
+                    let idx_size = compressed_index.len() as u32;
+                    idx_file.write_all(&idx_size.to_le_bytes())?;
+                    idx_file.write_all(&compressed_index)?;
+
+                    count += sessions.len();
+                }
             }
         }
 
@@ -577,25 +901,46 @@ impl Storage {
         debug!(sessions_indexed = count, "Reindex completed");
         Ok(count)
     }
+
     /// Comprehensive Database Statistics
     ///
     /// Tries an optimized path using the Index if available.
     /// Fallback to full data scan (slow) if index is missing.
     pub fn get_stats(&self) -> Result<DbStats> {
-        let path = self.get_active_file();
-        if !path.exists() {
-            return Ok(DbStats::default());
-        }
-
         let mut stats = DbStats {
-            file_name: path
+            file_name: self
+                .get_active_file()
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
-            total_size_bytes: fs::metadata(&path)?.len(),
-            ..Default::default()
+            session_count: 0,
+            message_count: 0,
+            min_time: 0,
+            max_time: 0,
+            total_size_bytes: 0,
+            data_compressed_bytes: 0,
+            data_uncompressed_bytes: 0,
         };
+
+        // 1. Count pending stats
+        if let Ok(pending) = self.get_pending_sessions() {
+            for s in pending {
+                stats.accumulate_session(&s);
+            }
+        }
+
+        // 2. Add pending file size to total disk usage
+        let pending_path = self.get_pending_file();
+        if pending_path.exists() {
+            stats.total_size_bytes += fs::metadata(&pending_path)?.len();
+        }
+
+        let path = self.get_active_file();
+        if !path.exists() {
+            return Ok(stats);
+        }
+        stats.total_size_bytes += fs::metadata(&path)?.len();
 
         let index_path = self.get_index_file();
         if index_path.exists() {
@@ -664,17 +1009,13 @@ impl Storage {
 
             // Deserialize
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
-            let StoredSession::V1(s) = wrapper;
-            {
-                stats.session_count += 1;
-                stats.message_count += s.messages.len() as u64;
-
-                if let Some(ts) = s.created_at {
-                    if stats.min_time == 0 || ts < stats.min_time {
-                        stats.min_time = ts;
-                    }
-                    if ts > stats.max_time {
-                        stats.max_time = ts;
+            match wrapper {
+                StoredSession::V1(s) => {
+                    stats.accumulate_session(&s);
+                }
+                StoredSession::Block(block_sessions) => {
+                    for s in &block_sessions {
+                        stats.accumulate_session(s);
                     }
                 }
             }

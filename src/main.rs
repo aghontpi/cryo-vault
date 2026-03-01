@@ -38,6 +38,9 @@ enum Commands {
         stream: bool,
     },
 
+    /// Flush pending sessions to the database
+    Flush,
+
     /// Search the archive
     Search {
         /// Query string (Regex supported)
@@ -213,7 +216,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
 
     if let Ok(input) = serde_json::from_str::<ChatSessionInput>(&content) {
         let session: ChatSessionV1 = input.into();
-        storage.append_session(session)?;
+        storage.append_pending(session)?;
         println!("Session saved to {}", db_path.display());
         return Ok(());
     }
@@ -234,11 +237,11 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
                 .progress_chars("#>-"),
         );
 
-        let mut writer = storage.get_writer()?;
+        let mut sessions_to_import = Vec::with_capacity(count);
         for conv in conversations {
             match conv.try_into() {
                 Ok(session) => {
-                    writer.append(session)?;
+                    sessions_to_import.push(session);
                     pb.inc(1);
                 }
                 Err(e) => {
@@ -247,9 +250,18 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
                 }
             }
         }
-        writer.flush()?;
+
+        let actual_count = sessions_to_import.len();
+        if actual_count > 0 {
+            storage.append_bulk(sessions_to_import)?;
+        }
+
         pb.finish_with_message("Import complete");
-        println!("Imported ChatGPT export to {}", db_path.display());
+        println!(
+            "Imported {} ChatGPT conversations to {}",
+            actual_count,
+            db_path.display()
+        );
         return Ok(());
     }
 
@@ -263,13 +275,16 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
                 .unwrap()
                 .progress_chars("#>-"));
 
-            let mut writer = storage.get_writer()?;
+            let mut sessions_to_import = Vec::with_capacity(count);
             for input in sessions {
-                let session: ChatSessionV1 = input.into();
-                writer.append(session)?;
+                sessions_to_import.push(input.into());
                 pb.inc(1);
             }
-            writer.flush()?;
+
+            if count > 0 {
+                storage.append_bulk(sessions_to_import)?;
+            }
+
             pb.finish_with_message("Import complete");
             println!("Imported {} sessions to {}", count, db_path.display());
             Ok(())
@@ -423,8 +438,29 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     }
 
     println!("Reindexing...");
-    let count = storage.reindex()?;
+    storage.flush_pending()?;
+    let count = match storage.reindex() {
+        Ok(c) => c,
+        Err(e)
+            if e.downcast_ref::<cryo_vault::storage::StorageError>()
+                .is_some_and(|err| {
+                    matches!(err, cryo_vault::storage::StorageError::DataFileNotFound)
+                }) =>
+        {
+            0
+        }
+        Err(e) => return Err(e),
+    };
     println!("✓ Reindexed {} sessions", count);
+    Ok(())
+}
+
+/// Handles the 'flush' command
+fn handle_flush(db_path: PathBuf) -> Result<()> {
+    let _lock = CryoLock::acquire(&db_path, 5000)?;
+    let storage = Storage::new(db_path);
+    let count = storage.flush_pending()?;
+    println!("Flushed {} sessions to database.", count);
     Ok(())
 }
 
@@ -450,6 +486,7 @@ fn main() -> Result<()> {
     // 2. Dispatch
     match cli.command {
         Commands::Add { file, stream } => handle_add(db_path, file, stream)?,
+        Commands::Flush => handle_flush(db_path)?,
         Commands::Search {
             query,
             after,

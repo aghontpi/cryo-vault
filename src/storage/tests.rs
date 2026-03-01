@@ -117,14 +117,18 @@ fn test_writer_rotation_explicit() {
 
     // Write session 1 (should fit or be close)
     let s1 = create_dummy_session("s1", 1);
-    writer.append(s1).expect("Failed to append s1");
+    writer
+        .append(StoredSession::V1(s1))
+        .expect("Failed to append s1");
 
     // Write session 2 (should trigger rotation if s1 + s2 > 100 bytes)
     // A session with 1 message is around ~80-100 bytes compressed/serialized usually.
     // Let's force it by writing a few.
     for i in 2..5 {
         let s = create_dummy_session(&format!("s{}", i), 1);
-        writer.append(s).expect("Failed to append");
+        writer
+            .append(StoredSession::V1(s))
+            .expect("Failed to append");
     }
 
     writer.flush().expect("Failed to flush");

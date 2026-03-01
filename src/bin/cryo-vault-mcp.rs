@@ -365,7 +365,7 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
     // Try ChatSessionInput (Single Object)
     if let Ok(input) = serde_json::from_value::<ChatSessionInput>(content.clone()) {
         let session: ChatSessionV1 = input.into();
-        storage.append_session(session)?;
+        storage.append_pending(session)?;
         return Ok("Session saved.".to_string());
     }
 
@@ -373,18 +373,21 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
     if let Ok(conversations) = serde_json::from_value::<Vec<ChatGptConversation>>(content.clone()) {
         let count = conversations.len();
         if count > 0 {
-            let mut writer = storage.get_writer()?;
-            let mut imported_count = 0;
+            let mut sessions_to_import = Vec::with_capacity(count);
             for conv in conversations {
                 if let Ok(session) = conv.try_into() {
-                    writer.append(session)?;
-                    imported_count += 1;
+                    sessions_to_import.push(session);
                 }
             }
-            writer.flush()?;
+
+            let actual_count = sessions_to_import.len();
+            if actual_count > 0 {
+                storage.append_bulk(sessions_to_import)?;
+            }
+
             return Ok(format!(
                 "Imported {}/{} conversations from ChatGPT export.",
-                imported_count, count
+                actual_count, count
             ));
         }
     }
@@ -393,12 +396,13 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
     match serde_json::from_value::<Vec<ChatSessionInput>>(content) {
         Ok(sessions) => {
             let count = sessions.len();
-            let mut writer = storage.get_writer()?;
+            let mut sessions_to_import = Vec::with_capacity(count);
             for input in sessions {
-                let session: ChatSessionV1 = input.into();
-                writer.append(session)?;
+                sessions_to_import.push(input.into());
             }
-            writer.flush()?;
+            if count > 0 {
+                storage.append_bulk(sessions_to_import)?;
+            }
             Ok(format!("Imported {} sessions.", count))
         }
         Err(_) => Err(anyhow::anyhow!(
