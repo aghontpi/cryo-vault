@@ -431,6 +431,10 @@ fn handle_show(db_path: PathBuf, session_id: String) -> Result<()> {
 
 /// Handles the 'reindex' command
 fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
+    // `reindex` now calls `flush_pending`, which writes to the archive data
+    // file. We must hold the same CryoLock as `add`/`flush`/`optimise` to
+    // avoid corrupting files when another process is appending concurrently.
+    let _lock = CryoLock::acquire(&db_path, 5000)?;
     let storage = Storage::new(db_path);
 
     if !yes {
@@ -504,8 +508,14 @@ fn handle_optimise(db_path: PathBuf, chunk_kb: usize, yes: bool) -> Result<()> {
 
     let storage = Storage::new(db_path.clone());
     let target_bytes = chunk_kb * 1024;
+
+    // Drain pending WAL into archive before optimising, otherwise recently
+    // ingested sessions are silently excluded from the rewrite AND the
+    // progress bar (which uses stats including pending) never reaches 100%.
+    storage.flush_pending()?;
+
     let stats = storage.get_stats()?;
-    let total_sessions = stats.session_count as u64;
+    let total_sessions = stats.session_count;
 
     let pb = make_progress_bar(total_sessions);
 
