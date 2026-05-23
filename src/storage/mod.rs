@@ -11,7 +11,7 @@ pub mod property_tests;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
 use tracing::{debug, trace};
 
@@ -19,6 +19,76 @@ use crate::schema::{ChatSessionInput, ChatSessionV1, StoredSession, StreamEvent}
 use constants::{DATA_MAGIC, MAX_FILE_SIZE};
 pub use types::{DbStats, StorageError};
 pub use writer::{SessionWriter, WalWriter};
+
+fn write_sessions_block(
+    data_writer: &mut BufWriter<File>,
+    index_writer: &mut BufWriter<File>,
+    data_offset: &mut u64,
+    sessions: &[ChatSessionV1],
+) -> Result<()> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+
+    let wrapper = if sessions.len() == 1 {
+        StoredSession::V1(sessions[0].clone())
+    } else {
+        StoredSession::Block(sessions.to_vec())
+    };
+
+    let raw_bytes = bincode::serialize(&wrapper).context("Failed to serialize block")?;
+    let compressed_bytes =
+        zstd::encode_all(&raw_bytes[..], 19).context("Failed to compress block")?;
+    let compressed_size = compressed_bytes.len() as u32;
+
+    // Build the BlockIndex
+    let mut full_text = String::new();
+    let mut min_time = u64::MAX;
+    let mut max_time = 0;
+    let mut message_count = 0;
+    let mut session_ids = Vec::new();
+
+    for session in sessions {
+        session_ids.push(session.id.clone());
+        full_text.push_str(&session.extract_full_text());
+        let created = session.created_at.unwrap_or(0);
+        if created < min_time {
+            min_time = created;
+        }
+        if created > max_time {
+            max_time = created;
+        }
+        message_count += session.messages.len() as u32;
+    }
+    if min_time == u64::MAX {
+        min_time = 0;
+    }
+
+    let index_entry = crate::index::BlockIndex::new(
+        session_ids.join(","),
+        crate::index::BlockIndexParams {
+            content: &full_text,
+            min_time,
+            max_time,
+            data_offset: *data_offset,
+            compressed_size,
+            uncompressed_size: raw_bytes.len() as u32,
+            message_count,
+        },
+    );
+
+    data_writer.write_all(&compressed_size.to_le_bytes())?;
+    data_writer.write_all(&compressed_bytes)?;
+    *data_offset += 4 + compressed_bytes.len() as u64;
+
+    let index_bytes = bincode::serialize(&index_entry)?;
+    let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
+    let idx_size = compressed_index.len() as u32;
+    index_writer.write_all(&idx_size.to_le_bytes())?;
+    index_writer.write_all(&compressed_index)?;
+
+    Ok(())
+}
 
 pub struct Storage {
     data_dir: PathBuf,
@@ -561,34 +631,22 @@ impl Storage {
                 let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
                 let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
-                match wrapper {
-                    StoredSession::V1(s) => {
-                        let mut found = false;
-                        for msg in &s.messages {
-                            if msg.content.to_lowercase().contains(&query.to_lowercase()) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found && !seen_ids.contains(&s.id) {
-                            seen_ids.insert(s.id.clone());
-                            results.push(s);
+                let sessions = match wrapper {
+                    StoredSession::V1(s) => vec![s],
+                    StoredSession::Block(sessions) => sessions,
+                    StoredSession::V2(block) => block.sessions,
+                };
+                for s in sessions {
+                    let mut found = false;
+                    for msg in &s.messages {
+                        if msg.content.to_lowercase().contains(&query.to_lowercase()) {
+                            found = true;
+                            break;
                         }
                     }
-                    StoredSession::Block(sessions) => {
-                        for s in sessions {
-                            let mut found = false;
-                            for msg in &s.messages {
-                                if msg.content.to_lowercase().contains(&query.to_lowercase()) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if found && !seen_ids.contains(&s.id) {
-                                seen_ids.insert(s.id.clone());
-                                results.push(s);
-                            }
-                        }
+                    if found && !seen_ids.contains(&s.id) {
+                        seen_ids.insert(s.id.clone());
+                        results.push(s);
                     }
                 }
             } else {
@@ -649,20 +707,15 @@ impl Storage {
             // Deserialize Bincode -> StoredSession
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
-            match wrapper {
-                StoredSession::V1(s) => {
-                    if !seen_ids.contains(&s.id) {
-                        seen_ids.insert(s.id.clone());
-                        sessions.push(s);
-                    }
-                }
-                StoredSession::Block(block_sessions) => {
-                    for s in block_sessions {
-                        if !seen_ids.contains(&s.id) {
-                            seen_ids.insert(s.id.clone());
-                            sessions.push(s);
-                        }
-                    }
+            let block_sessions = match wrapper {
+                StoredSession::V1(s) => vec![s],
+                StoredSession::Block(sessions) => sessions,
+                StoredSession::V2(block) => block.sessions,
+            };
+            for s in block_sessions {
+                if !seen_ids.contains(&s.id) {
+                    seen_ids.insert(s.id.clone());
+                    sessions.push(s);
                 }
             }
         }
@@ -750,6 +803,9 @@ impl Storage {
                     StoredSession::Block(sessions) => {
                         Ok(sessions.into_iter().find(|s| s.id == session_id))
                     }
+                    StoredSession::V2(block) => {
+                        Ok(block.sessions.into_iter().find(|s| s.id == session_id))
+                    }
                 };
             }
         }
@@ -814,6 +870,45 @@ impl Storage {
             let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
+            let build_block_index_and_len = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
+                let mut full_text = String::new();
+                let mut min_time = u64::MAX;
+                let mut max_time = 0;
+                let mut message_count = 0;
+                let mut session_ids = Vec::new();
+
+                for session in sessions {
+                    session_ids.push(session.id.clone());
+                    full_text.push_str(&session.extract_full_text());
+
+                    let created = session.created_at.unwrap_or(0);
+                    if created < min_time {
+                        min_time = created;
+                    }
+                    if created > max_time {
+                        max_time = created;
+                    }
+                    message_count += session.messages.len() as u32;
+                }
+                if min_time == u64::MAX {
+                    min_time = 0;
+                }
+
+                let entry = crate::index::BlockIndex::new(
+                    session_ids.join(","),
+                    crate::index::BlockIndexParams {
+                        content: &full_text,
+                        min_time,
+                        max_time,
+                        data_offset: offset,
+                        compressed_size: comp_size,
+                        uncompressed_size: uncomp_size,
+                        message_count,
+                    },
+                );
+                (entry, sessions.len())
+            };
+
             match wrapper {
                 StoredSession::V1(session) => {
                     // Extract content
@@ -845,49 +940,24 @@ impl Storage {
                     count += 1;
                 }
                 StoredSession::Block(sessions) => {
-                    let mut full_text = String::new();
-                    let mut min_time = u64::MAX;
-                    let mut max_time = 0;
-                    let mut message_count = 0;
-                    let mut session_ids = Vec::new();
-
-                    for session in &sessions {
-                        session_ids.push(session.id.clone());
-                        full_text.push_str(&session.extract_full_text());
-
-                        let created = session.created_at.unwrap_or(0);
-                        if created < min_time {
-                            min_time = created;
-                        }
-                        if created > max_time {
-                            max_time = created;
-                        }
-                        message_count += session.messages.len() as u32;
-                    }
-                    if min_time == u64::MAX {
-                        min_time = 0;
-                    }
-
-                    let index_entry = crate::index::BlockIndex::new(
-                        session_ids.join(","),
-                        crate::index::BlockIndexParams {
-                            content: &full_text,
-                            min_time,
-                            max_time,
-                            data_offset,
-                            compressed_size,
-                            uncompressed_size: raw_bytes.len() as u32,
-                            message_count,
-                        },
-                    );
-
+                    let (index_entry, sessions_len) = build_block_index_and_len(&sessions, data_offset, compressed_size, raw_bytes.len() as u32);
                     let index_bytes = bincode::serialize(&index_entry)?;
                     let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
                     let idx_size = compressed_index.len() as u32;
                     idx_file.write_all(&idx_size.to_le_bytes())?;
                     idx_file.write_all(&compressed_index)?;
 
-                    count += sessions.len();
+                    count += sessions_len;
+                }
+                StoredSession::V2(block) => {
+                    let (index_entry, sessions_len) = build_block_index_and_len(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32);
+                    let index_bytes = bincode::serialize(&index_entry)?;
+                    let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
+                    let idx_size = compressed_index.len() as u32;
+                    idx_file.write_all(&idx_size.to_le_bytes())?;
+                    idx_file.write_all(&compressed_index)?;
+
+                    count += sessions_len;
                 }
             }
         }
@@ -1018,9 +1088,151 @@ impl Storage {
                         stats.accumulate_session(s);
                     }
                 }
+                StoredSession::V2(block) => {
+                    for s in &block.sessions {
+                        stats.accumulate_session(s);
+                    }
+                }
             }
         }
 
         Ok(stats)
+    }
+
+    /// Rewrites the active data/index files using chunked blocks.
+    pub fn optimise(&self, target_bytes: usize) -> Result<(usize, usize)> {
+        self.optimise_with_progress(target_bytes, |_| {})
+    }
+
+    /// Optimise data file into ~target_bytes compressed blocks and rebuild index.
+    ///
+    /// Calls `on_session` for each session processed.
+    pub fn optimise_with_progress<F>(&self, target_bytes: usize, mut on_session: F) -> Result<(usize, usize)>
+    where
+        F: FnMut(usize),
+    {
+        let path = self.get_active_file();
+        let index_path = self.get_index_file();
+
+        if !path.exists() {
+            return Ok((0, 0));
+        }
+
+        let temp_data_path = path.with_extension("cryo.tmp");
+        let temp_index_path = index_path.with_extension("cryo.tmp");
+
+        let mut input = File::open(&path)?;
+
+        // Check Magic
+        let mut magic_buf = [0u8; 8];
+        input.read_exact(&mut magic_buf)?;
+        if magic_buf != DATA_MAGIC {
+            return Err(anyhow::anyhow!("Invalid file format"));
+        }
+
+        let data_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_data_path)?;
+        let index_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_index_path)?;
+
+        let mut data_writer = BufWriter::new(data_file);
+        let mut index_writer = BufWriter::new(index_file);
+
+        data_writer.write_all(DATA_MAGIC)?;
+        let mut data_offset = DATA_MAGIC.len() as u64;
+
+        let mut chunk_sessions: Vec<ChatSessionV1> = Vec::new();
+        let mut block_count = 0usize;
+        let mut session_count = 0usize;
+
+        loop {
+            let mut size_buf = [0u8; 4];
+            let n = input.read(&mut size_buf)?;
+            if n == 0 {
+                break;
+            }
+            if n < 4 {
+                input.read_exact(&mut size_buf[n..])?;
+            }
+            let compressed_size = u32::from_le_bytes(size_buf) as usize;
+            let mut compressed_buf = vec![0u8; compressed_size];
+            input.read_exact(&mut compressed_buf)?;
+
+            let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+            let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+
+            let sessions = match wrapper {
+                StoredSession::V1(session) => vec![session],
+                StoredSession::Block(sessions) => sessions,
+                StoredSession::V2(block) => block.sessions,
+            };
+
+            for session in sessions {
+                on_session(1);
+                chunk_sessions.push(session);
+
+                let wrapper = if chunk_sessions.len() == 1 {
+                    StoredSession::V1(chunk_sessions[0].clone())
+                } else {
+                    StoredSession::Block(chunk_sessions.clone())
+                };
+
+                let raw = bincode::serialize(&wrapper)?;
+                // Performance: use fast Zstd level 1 for trial compression size check
+                let compressed = zstd::encode_all(&raw[..], 1)?;
+
+                if compressed.len() > target_bytes && chunk_sessions.len() > 1 {
+                    let last = chunk_sessions.pop().expect("chunk has at least one session");
+                    write_sessions_block(
+                        &mut data_writer,
+                        &mut index_writer,
+                        &mut data_offset,
+                        &chunk_sessions,
+                    )?;
+                    block_count += 1;
+                    session_count += chunk_sessions.len();
+                    chunk_sessions.clear();
+                    chunk_sessions.push(last);
+                } else if compressed.len() >= target_bytes {
+                    write_sessions_block(
+                        &mut data_writer,
+                        &mut index_writer,
+                        &mut data_offset,
+                        &chunk_sessions,
+                    )?;
+                    block_count += 1;
+                    session_count += chunk_sessions.len();
+                    chunk_sessions.clear();
+                }
+            }
+        }
+
+        if !chunk_sessions.is_empty() {
+            write_sessions_block(
+                &mut data_writer,
+                &mut index_writer,
+                &mut data_offset,
+                &chunk_sessions,
+            )?;
+            block_count += 1;
+            session_count += chunk_sessions.len();
+            chunk_sessions.clear();
+        }
+
+        data_writer.flush()?;
+        index_writer.flush()?;
+        data_writer.get_mut().sync_all()?;
+        index_writer.get_mut().sync_all()?;
+
+        fs::rename(temp_data_path, path)?;
+        fs::rename(temp_index_path, index_path)?;
+
+        Ok((block_count, session_count))
     }
 }

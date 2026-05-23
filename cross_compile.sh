@@ -88,8 +88,25 @@ build_target "x86_64-pc-windows-gnu" "windows" "x64" "zigbuild" ".exe"
 build_target "aarch64-pc-windows-gnullvm" "windows" "arm64" "zigbuild" ".exe"
 
 # --- Android (Cross) ---
-build_target "x86_64-linux-android" "android" "x64" "zigbuild" ""
-build_target "aarch64-linux-android" "android" "arm64" "zigbuild" ""
+# Android builds require the Android NDK to compile C dependencies (like zstd-sys).
+# We check if there is an active NDK directory.
+NDK_FOUND=false
+if [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+    NDK_FOUND=true
+elif [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/ndk" ] && [ "$(ls -A "$ANDROID_HOME/ndk" 2>/dev/null)" ]; then
+    NDK_FOUND=true
+elif [ -n "$ANDROID_HOME" ] && [ -d "$ANDROID_HOME/ndk-bundle" ] && [ "$(ls -A "$ANDROID_HOME/ndk-bundle" 2>/dev/null)" ]; then
+    NDK_FOUND=true
+fi
+
+if [ "$NDK_FOUND" = true ]; then
+    build_target "x86_64-linux-android" "android" "x64" "zigbuild" ""
+    build_target "aarch64-linux-android" "android" "arm64" "zigbuild" ""
+else
+    echo "--------------------------------------------------"
+    echo "⚠️ Android NDK not found. Skipping Android target builds."
+    echo "To build for Android, please install the NDK and set ANDROID_NDK_HOME."
+fi
 
 echo "--------------------------------------------------"
 echo "🎉 All builds completed successfully!"

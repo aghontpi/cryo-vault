@@ -88,6 +88,17 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Optimise database into ~256KB compressed blocks
+    Optimise {
+        /// Target compressed block size in KB
+        #[arg(long, default_value = "256")]
+        chunk_kb: usize,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Parse date string (YYYY-MM-DD) or Unix timestamp
@@ -455,6 +466,62 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn make_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len.max(1));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb
+}
+
+/// Handles the 'optimise' command
+fn handle_optimise(db_path: PathBuf, chunk_kb: usize, yes: bool) -> Result<()> {
+    let _lock = CryoLock::acquire(&db_path, 5000)?;
+
+    if chunk_kb == 0 {
+        return Err(anyhow::anyhow!("chunk_kb must be greater than 0"));
+    }
+
+    if !yes {
+        println!("This will rewrite your data and index files.");
+        println!("A new block size of ~{} KB will be used.", chunk_kb);
+        print!("Continue? (y/N): ");
+        io::Write::flush(&mut io::stdout())?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let storage = Storage::new(db_path.clone());
+    let target_bytes = chunk_kb * 1024;
+    let stats = storage.get_stats()?;
+    let total_sessions = stats.session_count as u64;
+
+    let pb = make_progress_bar(total_sessions);
+
+    let (blocks, sessions) = storage.optimise_with_progress(target_bytes, |inc| {
+        pb.inc(inc as u64);
+    })?;
+
+    pb.finish_with_message("Optimise complete");
+
+    println!(
+        "Optimised {} sessions into {} blocks (~{} KB target).",
+        sessions, blocks, chunk_kb
+    );
+    Ok(())
+}
+
 /// Handles the 'flush' command
 fn handle_flush(db_path: PathBuf) -> Result<()> {
     let _lock = CryoLock::acquire(&db_path, 5000)?;
@@ -498,6 +565,7 @@ fn main() -> Result<()> {
         Commands::Last { count } => handle_last(db_path, count)?,
         Commands::Show { session_id } => handle_show(db_path, session_id)?,
         Commands::Reindex { yes } => handle_reindex(db_path, yes)?,
+        Commands::Optimise { chunk_kb, yes } => handle_optimise(db_path, chunk_kb, yes)?,
     }
 
     Ok(())

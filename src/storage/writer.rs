@@ -1,4 +1,4 @@
-use crate::schema::{StoredSession, StreamEvent};
+use crate::schema::{ChatSessionV1, StoredSession, StreamEvent};
 use crate::storage::constants::DATA_MAGIC;
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
@@ -71,6 +71,43 @@ impl SessionWriter {
         let written_bytes = 4 + compressed_bytes.len() as u64;
         self.current_size += written_bytes;
 
+        let build_block_index = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
+            let mut full_text = String::new();
+            let mut min_time = u64::MAX;
+            let mut max_time = 0;
+            let mut message_count = 0;
+            let mut session_ids = Vec::new();
+
+            for session in sessions {
+                session_ids.push(session.id.clone());
+                full_text.push_str(&session.extract_full_text());
+                let created = session.created_at.unwrap_or(0);
+                if created < min_time {
+                    min_time = created;
+                }
+                if created > max_time {
+                    max_time = created;
+                }
+                message_count += session.messages.len() as u32;
+            }
+            if min_time == u64::MAX {
+                min_time = 0;
+            }
+
+            crate::index::BlockIndex::new(
+                session_ids.join(","),
+                crate::index::BlockIndexParams {
+                    content: &full_text,
+                    min_time,
+                    max_time,
+                    data_offset: offset,
+                    compressed_size: comp_size,
+                    uncompressed_size: uncomp_size,
+                    message_count,
+                },
+            )
+        };
+
         let index_entry = match &wrapper {
             StoredSession::V1(session) => {
                 let full_text = session.extract_full_text();
@@ -92,40 +129,10 @@ impl SessionWriter {
                 )
             }
             StoredSession::Block(sessions) => {
-                let mut full_text = String::new();
-                let mut min_time = u64::MAX;
-                let mut max_time = 0;
-                let mut message_count = 0;
-                let mut session_ids = Vec::new();
-
-                for session in sessions {
-                    session_ids.push(session.id.clone());
-                    full_text.push_str(&session.extract_full_text());
-                    let created = session.created_at.unwrap_or(0);
-                    if created < min_time {
-                        min_time = created;
-                    }
-                    if created > max_time {
-                        max_time = created;
-                    }
-                    message_count += session.messages.len() as u32;
-                }
-                if min_time == u64::MAX {
-                    min_time = 0;
-                }
-
-                crate::index::BlockIndex::new(
-                    session_ids.join(","),
-                    crate::index::BlockIndexParams {
-                        content: &full_text,
-                        min_time,
-                        max_time,
-                        data_offset,
-                        compressed_size,
-                        uncompressed_size: raw_bytes.len() as u32,
-                        message_count,
-                    },
-                )
+                build_block_index(sessions, data_offset, compressed_size, raw_bytes.len() as u32)
+            }
+            StoredSession::V2(block) => {
+                build_block_index(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32)
             }
         };
 
@@ -138,6 +145,7 @@ impl SessionWriter {
         let count = match &wrapper {
             StoredSession::V1(_) => 1,
             StoredSession::Block(sessions) => sessions.len(),
+            StoredSession::V2(block) => block.sessions.len(),
         };
         trace!(
             compressed_size,

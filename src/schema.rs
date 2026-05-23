@@ -5,11 +5,17 @@ use uuid::Uuid;
 
 /// The top-level storage wrapper. This is what we write to disk.
 /// It uses a single byte tag (0, 1, 2...) to determine the version.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum StoredSession {
     V1(ChatSessionV1),
     Block(Vec<ChatSessionV1>),
-    // Future: V3
+    V2(SessionBlockV2),
+}
+
+/// Chunked block containing multiple sessions.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionBlockV2 {
+    pub sessions: Vec<ChatSessionV1>,
 }
 
 /// The Input DTO (V1).
