@@ -1,0 +1,36 @@
+@startuml Show Session (O(1) Lookup)
+
+User -> CLI: cryo show 72d313f9-...
+
+CLI -> Storage: get_session_by_id(id)
+activate Storage
+
+Storage -> IndexFile: open(index_001.cryo)
+activate IndexFile
+
+loop scan index
+    IndexFile -> Storage: read(compressed_index)
+    Storage -> Storage: decompress & parse
+    
+    alt session_id matches
+        Storage -> DataFile: seek(offset)\nread(size)
+        activate DataFile
+        DataFile --> Storage: compressed_data
+        deactivate DataFile
+        
+        Storage -> Storage: decompress()
+        Storage -> Storage: deserialize as StoredSession\n(V1 | Block | V2)
+        Storage --> CLI: Some(Session)
+        note right: O(1) - only 1 block read!
+    end
+end
+
+IndexFile --> Storage: EOF
+deactivate IndexFile
+
+Storage --> CLI: None (if not found)
+deactivate Storage
+
+CLI --> User: Session details\n+ all messages
+
+@enduml

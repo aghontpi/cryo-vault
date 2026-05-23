@@ -1,0 +1,31 @@
+@startuml Flush / Compaction
+
+User -> CLI: cryo flush
+
+CLI -> Storage: start_compaction()
+activate Storage
+
+Storage -> Storage: find_unsealed_v1_files()
+Storage -> Storage: load_all_into_memory()
+
+Storage -> Storage: compress_with_zstd()
+Storage -> Storage: create_block_header()
+Storage -> Storage: serialize_as_v2_block(StoredSession::V2)
+
+Storage -> DataFile: write_v2_block()
+activate DataFile
+DataFile --> Storage: offset
+deactivate DataFile
+
+Storage -> IndexFile: append_block_index()
+activate IndexFile
+IndexFile --> Storage: success
+deactivate IndexFile
+
+Storage -> Storage: delete_unsealed_v1_files()
+
+Storage --> CLI: Compaction complete
+deactivate Storage
+
+CLI --> User: Compacted N sessions into 1 block
+@enduml

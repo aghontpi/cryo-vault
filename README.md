@@ -359,6 +359,14 @@ Time Range:       2023-07-08 16:15:28 UTC to 2026-01-25 23:15:08 UTC
 *Consolidating WAL segments and active sessions into high-density Zstd compressed blocks.*
 <img src="docs/diagrams/optimise.png" width="500" />
 
+#### High-Density Flush
+*Packing unsealed active V1 JSON files into a single V2 Block for density.*
+<img src="docs/diagrams/flush.png" width="500" />
+
+#### Storage Statistics
+*Dynamically calculating storage sizes across mixed schema formats.*
+<img src="docs/diagrams/stats.png" width="500" />
+
 ### Contributing
 PRs are welcome! Whether it is a bug fix, new feature, or documentation improvement, feel free to open a pull request.
 Please ensure that your code follows standard Rust conventions and that all tests pass before submitting.

@@ -1,0 +1,27 @@
+@startuml Storage Stats
+
+User -> CLI: cryo stats
+
+CLI -> Storage: calculate_stats()
+activate Storage
+
+Storage -> Storage: list_all_storage_files()
+
+loop for each file
+    alt File is V1 (Unsealed JSON)
+        Storage -> Storage: calculate_v1_size()
+    else File is V2 (Sealed Block)
+        Storage -> Storage: read_block_header()
+        Storage -> Storage: sum_compressed_and_uncompressed_sizes()
+    end
+end
+
+Storage -> IndexFile: read_indexes()
+Storage -> Storage: calculate_index_overhead()
+
+Storage --> CLI: StorageStats { uncompressed, compressed, ratio }
+deactivate Storage
+
+CLI --> User: Display formatting (Total Size, Ratio, etc)
+
+@enduml
