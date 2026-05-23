@@ -1,10 +1,11 @@
 use anyhow::Result;
+use cryo_vault::lock::CryoLock;
 use cryo_vault::schema::{ChatGptConversation, ChatSessionInput, ChatSessionV1};
 use cryo_vault::storage::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonRpcRequest {
@@ -103,7 +104,7 @@ fn main() -> Result<()> {
 /// Note: Per MCP spec, requests have IDs and expect responses.
 /// Notifications (like "notifications/initialized") may have null IDs and typically don't require responses,
 /// but we return empty responses for compatibility.
-fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &PathBuf) -> JsonRpcResponse {
+fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &Path) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => {
             let result = json!({
@@ -222,7 +223,7 @@ fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &PathBuf) -> 
 fn handle_tool_call(
     params: CallToolParams,
     storage: &Storage,
-    _db_path: &PathBuf,
+    db_path: &Path,
     id: Option<Value>,
 ) -> JsonRpcResponse {
     match params.name.as_str() {
@@ -253,17 +254,30 @@ fn handle_tool_call(
                 } else {
                     match val_ref {
                         Value::String(s) => serde_json::from_str(s)
-                            .or_else(|_| Err(anyhow::anyhow!("String data is not valid JSON"))),
+                            .map_err(|_| anyhow::anyhow!("String data is not valid JSON")),
                         _ => Ok(val_ref.clone()),
                     }
                 }
             };
 
             match get_json() {
-                Ok(json_val) => match ingest_content(storage, json_val) {
-                    Ok(msg) => success(id, json!({ "content": [{ "type": "text", "text": msg }] })),
-                    Err(e) => error(id, 1, format!("Ingestion failed: {}", e)),
-                },
+                Ok(json_val) => {
+                    // Hold the same CryoLock the CLI uses so concurrent
+                    // `cryo add` / `cryo flush` invocations don't corrupt
+                    // pending.bin or the archive.
+                    let _lock = match CryoLock::acquire(db_path, 5000) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            return error(id, 1, format!("Could not acquire DB lock: {}", e));
+                        }
+                    };
+                    match ingest_content(storage, json_val) {
+                        Ok(msg) => {
+                            success(id, json!({ "content": [{ "type": "text", "text": msg }] }))
+                        }
+                        Err(e) => error(id, 1, format!("Ingestion failed: {}", e)),
+                    }
+                }
                 Err(e) => error(id, 1, format!("Input processing failed: {}", e)),
             }
         }
