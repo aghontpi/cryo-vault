@@ -598,6 +598,71 @@ fn test_search_includes_block_sessions_without_created_at() {
     );
 }
 
+/// When the index file is partially truncated (a known shape of corruption
+/// from older releases where CLI `add` and MCP `add_log` raced without a
+/// shared lock), search must still return matches from the unindexed tail of
+/// the data file. The previous implementation walked data and index in
+/// lockstep — once the index EOF'd, the remaining data blocks became
+/// silently invisible to search even though `scan_all` could still see them.
+#[test]
+fn test_search_recovers_when_index_is_truncated() {
+    let (storage, _temp) = create_test_storage();
+    let data_dir = _temp.path().to_path_buf();
+
+    // Six distinct sessions, each with a unique marker word.
+    for i in 0..6 {
+        let mut s = create_dummy_session(&format!("trunc-{}", i), 1);
+        s.messages[0].content = format!("marker-{} content", i);
+        storage.append_session(s).unwrap();
+    }
+
+    // Sanity check: with a healthy index, search finds every marker.
+    for i in 0..6 {
+        let q = format!("marker-{}", i);
+        let hits = storage.search(&q, None, None).unwrap();
+        assert!(
+            hits.iter().any(|s| s.id == format!("trunc-{}", i)),
+            "healthy index should find {}",
+            q
+        );
+    }
+
+    // Simulate the corruption: truncate the index file so it only describes
+    // the first two blocks. The data file is untouched.
+    let index_path = data_dir.join("index_001.cryo");
+    let buf = std::fs::read(&index_path).unwrap();
+    let mut off = 0usize;
+    let mut kept_bytes = 0usize;
+    for _ in 0..2 {
+        let sz =
+            u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        off += 4 + sz;
+        kept_bytes = off;
+    }
+    std::fs::write(&index_path, &buf[..kept_bytes]).unwrap();
+    assert!(
+        kept_bytes < buf.len(),
+        "test setup: index must actually be truncated"
+    );
+
+    // Markers 0–1 still have index entries; markers 2–5 do not. All six must
+    // still be searchable — search must walk the unindexed tail.
+    for i in 0..6 {
+        let q = format!("marker-{}", i);
+        let hits = storage.search(&q, None, None).unwrap();
+        assert!(
+            hits.iter().any(|s| s.id == format!("trunc-{}", i)),
+            "search must recover {} from unindexed data (index truncated)",
+            q
+        );
+    }
+
+    // And — importantly — a query that matches none of the stored sessions
+    // must still return zero, even when half the blocks are unindexed.
+    let none = storage.search("nonexistent-token-zzz", None, None).unwrap();
+    assert_eq!(none.len(), 0);
+}
+
 #[test]
 fn test_search_bloom_filter_false_positive() {
     let (storage, _temp) = create_test_storage();
