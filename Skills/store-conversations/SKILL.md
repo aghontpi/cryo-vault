@@ -72,6 +72,27 @@ cat logs.json | cryo add -
 tail -f live_logs.jsonl | cryo add --stream -
 ```
 
+**Always set `title` when ingesting.** The field is optional in the wire
+format for backwards compatibility, but `cryo last` / `cryo first` /
+`cryo search` print it as the human label for each session. Omitting it
+fills the archive with `Untitled` entries that no one can browse.
+
+When *you* (the model) ingest a session — whether via `cryo add` or the
+MCP `add_log` tool — include a 3–7 word summary in `title`:
+
+- Specific enough to find again with `cryo search`.
+- A *summary of what the session is about*, not a verbatim copy of the
+  first user message.
+- Sentence-case or lowercase, no trailing punctuation.
+- Good: `JWT auth refresh flow`, `Debug Nginx streaming proxy`,
+  `Migrate Postgres to RDS`.
+- Bad: `Untitled`, `Chat`, `Conversation`, `New chat`, `""`,
+  or pasting the user's literal first message.
+
+If the content genuinely resists a summary (a one-line lookup, a single
+test message), use a short topical phrase like `Quick lookup` or
+`One-off question` — never a placeholder.
+
 ### 2. Flush the WAL (`flush`)
 
 Manually flush completed sessions from the Write-Ahead Log (`pending.bin`) into the active data segment.

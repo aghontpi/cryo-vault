@@ -113,7 +113,7 @@ Cryo Vault v0.2.0 includes major architecture upgrades to support high-density b
 | :--- | :--- | :--- | :--- |
 | **`messages`** | `Array` | **Yes*** | List of message objects. (*Defaults to empty if missing) |
 | `id` | `String` | No | Unique ID (UUID). Auto-generated if omitted. |
-| `title` | `String` | No | A title for the session. |
+| `title` | `String` | No (strongly recommended) | A 3–7 word summary of the session. See [Title expectations](#title-expectations) — omitting this leaves the entry showing up as `Untitled` in `cryo last` / `cryo search`. |
 | `source` | `String` | No | Origin (e.g., "cli", "vscode"). |
 | `model` | `String` | No | AI model name (e.g., "gpt-4"). |
 | `created_at` | `Number` | No | Unix timestamp (seconds). |
@@ -126,6 +126,20 @@ Cryo Vault v0.2.0 includes major architecture upgrades to support high-density b
 | **`content`** | `String` | **Yes** | The text content. |
 | `id` | `String` | No | Unique ID for the message. |
 | `parent_id` | `String` | No | ID of the parent message. |
+
+### Title expectations
+
+The `title` field is technically optional for backwards compatibility, but **callers should treat it as required**. It's what `cryo last`, `cryo first`, and `cryo search` print as the human-readable label for each session — when it's missing, the archive becomes a wall of `Untitled` entries that's almost impossible to browse.
+
+When ingesting via the MCP server (i.e. from an AI client), the model is expected to summarise the session into the title field at ingest time. Good titles are:
+
+- **3–7 words**, lowercase or sentence-case, no trailing punctuation.
+- A **summary of what the session is about**, not a re-statement of the first user message verbatim.
+- Specific enough to find with `cryo search` later.
+
+Examples of good titles: `JWT auth refresh flow`, `Debug Nginx streaming proxy`, `Migrate Postgres to RDS`, `Reproducible build metadata removal`.
+
+Do **not** send the literal strings `Untitled`, `Chat`, `Conversation`, `New chat`, or an empty string — write an actual summary instead. If you genuinely can't summarise the content (e.g. the session contains a single one-word message), fall back to a short topical phrase (`Quick lookup`, `One-off question`) rather than a placeholder.
 
 ```bash
 ## Full Example
