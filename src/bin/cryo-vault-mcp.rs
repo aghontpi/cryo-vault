@@ -143,7 +143,19 @@ fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &Path) -> Jso
                                   - messages: Array of objects with:\n\
                                     - role: \"user\" | \"model\" | \"system\"\n\
                                     - content: String\n\
-                                  - title: Option<String>\n\
+                                  - title: String — STRONGLY RECOMMENDED.\n\
+                                    A 3-7 word summary of what the session is\n\
+                                    about (e.g. \"JWT auth refresh flow\",\n\
+                                    \"Debug Nginx streaming proxy\"). The\n\
+                                    field is technically optional for legacy\n\
+                                    callers, but you SHOULD always send one:\n\
+                                    `cryo last` / `cryo search` display this\n\
+                                    title, so omitting it leaves the entry\n\
+                                    showing up as \"Untitled\" and unfindable\n\
+                                    by humans browsing the archive.\n\
+                                    Do NOT send the literal string \"Untitled\",\n\
+                                    \"Chat\", \"Conversation\", or the empty\n\
+                                    string — write an actual summary instead.\n\
                                   - model: Option<String>\n\
                                   - created_at: Option<u64> (Unix timestamp)"
                         .to_string(),

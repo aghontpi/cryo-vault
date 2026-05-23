@@ -28,8 +28,41 @@ A high-performance, highly compressed database for storing chat conversations ir
 
 ## Getting Started
 
-### 1. Building
-Cryo Vault produces two binaries: one for CLI usage and one for MCP integration.
+### 1. Install (recommended)
+
+A one-shot installer is provided for each major platform. It detects your OS / arch, drops the binaries under `~/.cryo-vault/versions/<version>/`, symlinks (or shims, on Windows) `cryo` and `cryo-vault-mcp` into `~/.cryo-vault/bin`, and wires that directory onto your `PATH` so typing `cryo` from any new terminal Just Works.
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+iwr -useb https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.ps1 | iex
+```
+
+Or, after cloning the repo:
+```bash
+./install.sh           # macOS / Linux
+./install.ps1          # Windows
+```
+
+The installer is idempotent: re-running it upgrades to the latest version and removes any prior install it finds. Useful flags:
+
+| Flag (bash / pwsh) | Purpose |
+| :--- | :--- |
+| `--version v0.2.0` / `-Version v0.2.0` | Pin a specific release. |
+| `--prefix <path>` / `-Prefix <path>` | Change the install location (default `~/.cryo-vault`). |
+| `--source local\|github` / `-Source local\|github` | Force the binary source. Auto-detects `dist/` when run from a clone. |
+| `--force` / `-Force` | Reinstall even if the same version is already present. |
+| `--uninstall` / `-Uninstall` | Remove the install and clean the PATH entry. |
+| `--no-path` / `-NoPath` | Skip editing your shell rc / user PATH. |
+
+After install, `cryo --help` works from any new shell. The MCP server is available as `cryo-vault-mcp` on the same `PATH` — see [C. MCP Server Usage](#c-mcp-server-usage-for-ai) below.
+
+### 2. Building from source
+If you'd rather build it yourself, Cryo Vault produces two binaries:
 
 ```bash
 cargo build --release
@@ -80,7 +113,7 @@ Cryo Vault v0.2.0 includes major architecture upgrades to support high-density b
 | :--- | :--- | :--- | :--- |
 | **`messages`** | `Array` | **Yes*** | List of message objects. (*Defaults to empty if missing) |
 | `id` | `String` | No | Unique ID (UUID). Auto-generated if omitted. |
-| `title` | `String` | No | A title for the session. |
+| `title` | `String` | No (strongly recommended) | A 3–7 word summary of the session. See [Title expectations](#title-expectations) — omitting this leaves the entry showing up as `Untitled` in `cryo last` / `cryo search`. |
 | `source` | `String` | No | Origin (e.g., "cli", "vscode"). |
 | `model` | `String` | No | AI model name (e.g., "gpt-4"). |
 | `created_at` | `Number` | No | Unix timestamp (seconds). |
@@ -93,6 +126,20 @@ Cryo Vault v0.2.0 includes major architecture upgrades to support high-density b
 | **`content`** | `String` | **Yes** | The text content. |
 | `id` | `String` | No | Unique ID for the message. |
 | `parent_id` | `String` | No | ID of the parent message. |
+
+### Title expectations
+
+The `title` field is technically optional for backwards compatibility, but **callers should treat it as required**. It's what `cryo last`, `cryo first`, and `cryo search` print as the human-readable label for each session — when it's missing, the archive becomes a wall of `Untitled` entries that's almost impossible to browse.
+
+When ingesting via the MCP server (i.e. from an AI client), the model is expected to summarise the session into the title field at ingest time. Good titles are:
+
+- **3–7 words**, lowercase or sentence-case, no trailing punctuation.
+- A **summary of what the session is about**, not a re-statement of the first user message verbatim.
+- Specific enough to find with `cryo search` later.
+
+Examples of good titles: `JWT auth refresh flow`, `Debug Nginx streaming proxy`, `Migrate Postgres to RDS`, `Reproducible build metadata removal`.
+
+Do **not** send the literal strings `Untitled`, `Chat`, `Conversation`, `New chat`, or an empty string — write an actual summary instead. If you genuinely can't summarise the content (e.g. the session contains a single one-word message), fall back to a short topical phrase (`Quick lookup`, `One-off question`) rather than a placeholder.
 
 ```bash
 ## Full Example

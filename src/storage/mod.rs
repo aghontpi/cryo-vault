@@ -686,87 +686,134 @@ impl Storage {
                 ));
             }
 
+            // Walk the data file sequentially. When an index entry is
+            // available we use it for fast bloom-filter / time-range pruning.
+            // When the index runs out before the data does — a known shape of
+            // index corruption from older releases where MCP `add_log` and
+            // CLI `add` raced without a shared lock — we fall back to
+            // decompressing each unindexed block and content-checking it
+            // directly. This keeps search correct (no missing matches) at a
+            // proportional speed cost on the unindexed tail.
+            let mut idx_exhausted = false;
+            let mut unindexed_blocks_scanned: u64 = 0;
+
             loop {
-                let mut idx_size_buf = [0u8; 4];
-                let n = idx_file.read(&mut idx_size_buf)?;
-                if n == 0 {
-                    break;
-                } // Clean EOF
-                if n < 4 {
-                    idx_file.read_exact(&mut idx_size_buf[n..])?;
-                }
-                let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
-
-                let mut compressed_idx_buf = vec![0u8; idx_size];
-                idx_file.read_exact(&mut compressed_idx_buf)?;
-
-                let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
-                let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
+                let index_opt: Option<crate::index::BlockIndex> = if idx_exhausted {
+                    None
+                } else {
+                    let mut idx_size_buf = [0u8; 4];
+                    let n = idx_file.read(&mut idx_size_buf)?;
+                    if n == 0 {
+                        idx_exhausted = true;
+                        None
+                    } else {
+                        if n < 4 {
+                            idx_file.read_exact(&mut idx_size_buf[n..])?;
+                        }
+                        let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
+                        let mut compressed_idx_buf = vec![0u8; idx_size];
+                        idx_file.read_exact(&mut compressed_idx_buf)?;
+                        let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
+                        Some(bincode::deserialize(&idx_buf)?)
+                    }
+                };
 
                 let mut size_buf = [0u8; 4];
-                file.read_exact(&mut size_buf)?;
+                let n = file.read(&mut size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    file.read_exact(&mut size_buf[n..])?;
+                }
                 let size = u32::from_le_bytes(size_buf) as usize;
 
-                if let Some(after_ts) = after
-                    && index.max_time < after_ts
-                {
-                    file.seek(io::SeekFrom::Current(size as i64))?;
-                    continue;
-                }
-                if let Some(before_ts) = before
-                    && index.min_time > before_ts
-                {
-                    file.seek(io::SeekFrom::Current(size as i64))?;
-                    continue;
+                if index_opt.is_none() {
+                    unindexed_blocks_scanned += 1;
                 }
 
-                if index.matches(query) {
-                    let mut compressed_buf = vec![0u8; size];
-                    file.read_exact(&mut compressed_buf)?;
+                // Time-range prefilter via index (only when block-level
+                // bounds are known — without an index we have to decompress
+                // and do the per-session check below).
+                if let Some(ref idx) = index_opt {
+                    if let Some(after_ts) = after
+                        && idx.max_time < after_ts
+                    {
+                        file.seek(io::SeekFrom::Current(size as i64))?;
+                        continue;
+                    }
+                    if let Some(before_ts) = before
+                        && idx.min_time > before_ts
+                    {
+                        file.seek(io::SeekFrom::Current(size as i64))?;
+                        continue;
+                    }
+                }
 
-                    let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-                    let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+                // Bloom-filter prefilter when an index entry is present.
+                // No index entry → can't prune, fall through to decompress.
+                let must_decompress = match index_opt.as_ref() {
+                    Some(idx) => idx.matches(query),
+                    None => true,
+                };
 
-                    let sessions = match wrapper {
-                        StoredSession::V1(s) => vec![s],
-                        StoredSession::Block(sessions) => sessions,
-                        StoredSession::V2(block) => block.sessions,
-                    };
-                    for s in sessions {
-                        // Per-session time filter — block-level min/max can let
-                        // sessions outside the requested range slip through when a
-                        // block straddles the boundary or contains sessions with
-                        // no `created_at`.
-                        if let Some(after_ts) = after {
-                            if let Some(ct) = s.created_at {
-                                if ct < after_ts {
-                                    continue;
-                                }
-                            }
-                        }
-                        if let Some(before_ts) = before {
-                            if let Some(ct) = s.created_at {
-                                if ct > before_ts {
-                                    continue;
-                                }
-                            }
-                        }
+                if !must_decompress {
+                    file.seek(std::io::SeekFrom::Current(size as i64))?;
+                    continue;
+                }
 
-                        let mut found = false;
-                        for msg in &s.messages {
-                            if msg.content.to_lowercase().contains(&query_lower) {
-                                found = true;
-                                break;
+                let mut compressed_buf = vec![0u8; size];
+                file.read_exact(&mut compressed_buf)?;
+
+                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+
+                let sessions = match wrapper {
+                    StoredSession::V1(s) => vec![s],
+                    StoredSession::Block(sessions) => sessions,
+                    StoredSession::V2(block) => block.sessions,
+                };
+                for s in sessions {
+                    // Per-session time filter — block-level min/max can let
+                    // sessions outside the requested range slip through when a
+                    // block straddles the boundary or contains sessions with
+                    // no `created_at`.
+                    if let Some(after_ts) = after {
+                        if let Some(ct) = s.created_at {
+                            if ct < after_ts {
+                                continue;
                             }
-                        }
-                        if found && !seen_ids.contains(&s.id) {
-                            seen_ids.insert(s.id.clone());
-                            results.push(s);
                         }
                     }
-                } else {
-                    file.seek(std::io::SeekFrom::Current(size as i64))?;
+                    if let Some(before_ts) = before {
+                        if let Some(ct) = s.created_at {
+                            if ct > before_ts {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut found = false;
+                    for msg in &s.messages {
+                        if msg.content.to_lowercase().contains(&query_lower) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found && !seen_ids.contains(&s.id) {
+                        seen_ids.insert(s.id.clone());
+                        results.push(s);
+                    }
                 }
+            }
+
+            if unindexed_blocks_scanned > 0 {
+                tracing::warn!(
+                    segment = %path.display(),
+                    unindexed_blocks = unindexed_blocks_scanned,
+                    "Index is out of sync with data (missing entries for {} blocks). Search fell back to full scan for those blocks. Run `cryo reindex` to restore fast search.",
+                    unindexed_blocks_scanned
+                );
             }
         }
 
@@ -946,6 +993,18 @@ impl Storage {
     /// 4. Writes index entries to the temp file.
     /// 5. Rename temp file to actual index file.
     pub fn reindex(&self) -> Result<usize> {
+        self.reindex_with_progress(|| {})
+    }
+
+    /// Reindex with a per-block progress callback.
+    ///
+    /// `on_block` fires once per data block successfully indexed (paired
+    /// with [`count_archive_blocks`] as the bar denominator). Callers that
+    /// don't care can pass `|| {}`.
+    pub fn reindex_with_progress<F>(&self, mut on_block: F) -> Result<usize>
+    where
+        F: FnMut(),
+    {
         debug!("Starting reindex operation");
 
         let segments = self.list_segments();
@@ -959,15 +1018,61 @@ impl Storage {
             if !path.exists() {
                 continue;
             }
-            total_count += self.reindex_segment(&path, &index_path)?;
+            total_count += self.reindex_segment(&path, &index_path, &mut on_block)?;
         }
 
         debug!(sessions_indexed = total_count, "Reindex completed");
         Ok(total_count)
     }
 
+    /// Total number of compressed blocks across every archive segment.
+    ///
+    /// Reads only the 4-byte size headers and seeks past each block payload,
+    /// so this is O(blocks) reads with no decompression. Useful as a
+    /// progress-bar denominator for `reindex`, where the existing index is
+    /// untrustworthy and `stats` would lie.
+    pub fn count_archive_blocks(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for (path, _index_path, _seg) in self.list_segments() {
+            if !path.exists() {
+                continue;
+            }
+            let mut file = File::open(&path)?;
+            let mut magic = [0u8; 8];
+            file.read_exact(&mut magic)?;
+            if magic != DATA_MAGIC {
+                return Err(anyhow::anyhow!(
+                    "Invalid file format in {}",
+                    path.display()
+                ));
+            }
+            loop {
+                let mut size_buf = [0u8; 4];
+                let n = file.read(&mut size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    file.read_exact(&mut size_buf[n..])?;
+                }
+                let size = u32::from_le_bytes(size_buf) as i64;
+                file.seek(io::SeekFrom::Current(size))?;
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
     /// Rebuilds the index for a single segment atomically (temp file → rename).
-    fn reindex_segment(&self, path: &PathBuf, index_path: &PathBuf) -> Result<usize> {
+    fn reindex_segment<F>(
+        &self,
+        path: &PathBuf,
+        index_path: &PathBuf,
+        on_block: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(),
+    {
         let temp_index_path = index_path.with_extension("cryo.tmp");
 
         let mut file = File::open(path)?;
@@ -1063,6 +1168,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += 1;
+                    on_block();
                 }
                 StoredSession::Block(sessions) => {
                     let (index_entry, sessions_len) = build_block_index_and_len(&sessions, data_offset, compressed_size, raw_bytes.len() as u32);
@@ -1073,6 +1179,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += sessions_len;
+                    on_block();
                 }
                 StoredSession::V2(block) => {
                     let (index_entry, sessions_len) = build_block_index_and_len(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32);
@@ -1083,6 +1190,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += sessions_len;
+                    on_block();
                 }
             }
         }
