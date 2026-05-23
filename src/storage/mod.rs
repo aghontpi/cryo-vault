@@ -20,6 +20,58 @@ use constants::{DATA_MAGIC, MAX_FILE_SIZE};
 pub use types::{DbStats, StorageError};
 pub use writer::{SessionWriter, WalWriter};
 
+/// Computes the (min_time, max_time) range for a block of sessions.
+///
+/// Rule: if any session in the block has no `created_at`, we cannot safely
+/// exclude the block from time-filtered queries, so we widen the range to
+/// `[0, u64::MAX]` — matching the V1 single-session behaviour where
+/// `unwrap_or(0)` / `unwrap_or(u64::MAX)` was used.
+///
+/// This must be kept in sync between `write_sessions_block`, the writer's
+/// `append` path, and `reindex`. Otherwise sessions without a timestamp
+/// silently become invisible to `cryo search --after T`.
+pub(crate) fn compute_block_time_range(sessions: &[ChatSessionV1]) -> (u64, u64) {
+    let mut min_time = u64::MAX;
+    let mut max_time = 0u64;
+    let mut has_missing = false;
+
+    for session in sessions {
+        match session.created_at {
+            Some(ts) => {
+                if ts < min_time {
+                    min_time = ts;
+                }
+                if ts > max_time {
+                    max_time = ts;
+                }
+            }
+            None => has_missing = true,
+        }
+    }
+
+    if has_missing {
+        // At least one session has no timestamp — widen the range so block-level
+        // time filtering can never exclude it. Per-session filtering inside
+        // `search` decides what to actually return.
+        (0, u64::MAX)
+    } else if min_time == u64::MAX {
+        // Empty list (defensive — callers guard against this).
+        (0, 0)
+    } else {
+        (min_time, max_time)
+    }
+}
+
+/// Number of session IDs encoded in a BlockIndex.session_id field.
+/// Block indexes join IDs with ",", a single-session V1 entry has no separator.
+pub(crate) fn count_sessions_in_index_id(joined: &str) -> u64 {
+    if joined.is_empty() {
+        0
+    } else {
+        joined.split(',').count() as u64
+    }
+}
+
 fn write_sessions_block(
     data_writer: &mut BufWriter<File>,
     index_writer: &mut BufWriter<File>,
@@ -43,26 +95,16 @@ fn write_sessions_block(
 
     // Build the BlockIndex
     let mut full_text = String::new();
-    let mut min_time = u64::MAX;
-    let mut max_time = 0;
     let mut message_count = 0;
     let mut session_ids = Vec::new();
 
     for session in sessions {
         session_ids.push(session.id.clone());
         full_text.push_str(&session.extract_full_text());
-        let created = session.created_at.unwrap_or(0);
-        if created < min_time {
-            min_time = created;
-        }
-        if created > max_time {
-            max_time = created;
-        }
         message_count += session.messages.len() as u32;
     }
-    if min_time == u64::MAX {
-        min_time = 0;
-    }
+
+    let (min_time, max_time) = compute_block_time_range(sessions);
 
     let index_entry = crate::index::BlockIndex::new(
         session_ids.join(","),
@@ -157,6 +199,35 @@ impl Storage {
         self.data_dir.join("pending.bin")
     }
 
+    /// All `(data_path, index_path, seg_num)` triples on disk, sorted by
+    /// segment number ascending.
+    ///
+    /// Before this helper, every read path (`scan_all`, `search`,
+    /// `get_session_by_id`, `get_stats`, `reindex`) only ever inspected the
+    /// single highest-numbered segment, so once rotation triggered (>1 GB
+    /// per file) all older data became silently invisible.
+    fn list_segments(&self) -> Vec<(PathBuf, PathBuf, u32)> {
+        let mut segs: Vec<(PathBuf, PathBuf, u32)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with("data_")
+                    && name.ends_with(".cryo")
+                    && let Some(num_str) = name
+                        .strip_prefix("data_")
+                        .and_then(|s| s.strip_suffix(".cryo"))
+                    && let Ok(num) = num_str.parse::<u32>()
+                {
+                    let data_path = self.data_dir.join(format!("data_{:03}.cryo", num));
+                    let index_path = self.data_dir.join(format!("index_{:03}.cryo", num));
+                    segs.push((data_path, index_path, num));
+                }
+            }
+        }
+        segs.sort_by_key(|(_, _, n)| *n);
+        segs
+    }
+
     pub fn get_writer(&self) -> Result<SessionWriter> {
         let (data_path, index_path, seg_num) = self.get_active_files(MAX_FILE_SIZE)?;
         if let Some(parent) = data_path.parent() {
@@ -241,53 +312,67 @@ impl Storage {
 
     /// Appends a session directly to the WAL buffer and triggers a flush if > 256KB
     pub fn append_pending(&self, session: ChatSessionV1) -> Result<()> {
-        let mut wal = self.get_wal_writer()?;
+        // Scope the WAL writer so it is dropped (and its OS handle closed)
+        // before we potentially re-open pending.bin with truncate=true in
+        // `flush_pending`. Holding an append handle while another open call
+        // truncates the same file is fragile on Windows.
+        {
+            let mut wal = self.get_wal_writer()?;
 
-        let mut metadata: HashMap<String, serde_json::Value> =
-            serde_json::from_str(&session.metadata_json).unwrap_or_default();
+            let mut metadata: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&session.metadata_json).unwrap_or_default();
 
-        if let Some(t) = &session.title {
-            metadata.insert("title".to_string(), serde_json::Value::String(t.clone()));
-        }
-        if let Some(s) = &session.source {
-            metadata.insert("source".to_string(), serde_json::Value::String(s.clone()));
-        }
-        if let Some(m) = &session.model {
-            metadata.insert("model".to_string(), serde_json::Value::String(m.clone()));
-        }
-        if let Some(c) = session.created_at {
-            metadata.insert(
-                "created_at".to_string(),
-                serde_json::Value::Number(c.into()),
-            );
-        }
+            // Strip any pre-existing keys that overlap with top-level fields so
+            // we don't double-serialise them; the top-level field is the source
+            // of truth on the round-trip in `get_pending_sessions`.
+            metadata.remove("title");
+            metadata.remove("source");
+            metadata.remove("model");
+            metadata.remove("created_at");
 
-        wal.append(StreamEvent::SessionStart {
-            session_id: session.id.clone(),
-            metadata,
-        })?;
+            if let Some(t) = &session.title {
+                metadata.insert("title".to_string(), serde_json::Value::String(t.clone()));
+            }
+            if let Some(s) = &session.source {
+                metadata.insert("source".to_string(), serde_json::Value::String(s.clone()));
+            }
+            if let Some(m) = &session.model {
+                metadata.insert("model".to_string(), serde_json::Value::String(m.clone()));
+            }
+            if let Some(c) = session.created_at {
+                metadata.insert(
+                    "created_at".to_string(),
+                    serde_json::Value::Number(c.into()),
+                );
+            }
 
-        for msg in session.messages {
-            let msg_input = crate::schema::MessageInput {
-                role: msg.role,
-                content: msg.content,
-                tool_calls: msg.tool_calls,
-                tool_outputs: msg.tool_outputs,
-                id: msg.id,
-                parent_id: msg.parent_id,
-                metadata: serde_json::from_str(&msg.metadata_json).unwrap_or_default(),
-            };
-            wal.append(StreamEvent::AppendMessage {
+            wal.append(StreamEvent::SessionStart {
                 session_id: session.id.clone(),
-                message: msg_input,
+                metadata,
             })?;
-        }
 
-        wal.append(StreamEvent::Finalize {
-            session_id: session.id,
-        })?;
+            for msg in session.messages {
+                let msg_input = crate::schema::MessageInput {
+                    role: msg.role,
+                    content: msg.content,
+                    tool_calls: msg.tool_calls,
+                    tool_outputs: msg.tool_outputs,
+                    id: msg.id,
+                    parent_id: msg.parent_id,
+                    metadata: serde_json::from_str(&msg.metadata_json).unwrap_or_default(),
+                };
+                wal.append(StreamEvent::AppendMessage {
+                    session_id: session.id.clone(),
+                    message: msg_input,
+                })?;
+            }
 
-        wal.flush()?;
+            wal.append(StreamEvent::Finalize {
+                session_id: session.id,
+            })?;
+
+            wal.flush()?;
+        } // wal dropped here, OS handle closed
 
         // Trigger auto-flush if > 256KB
         let len = fs::metadata(self.get_pending_file())?.len();
@@ -533,11 +618,10 @@ impl Storage {
         before: Option<u64>,
     ) -> Result<Vec<ChatSessionV1>> {
         trace!(query, ?after, ?before, "Starting search");
-        let path = self.get_active_file();
-        let index_path = self.get_index_file();
 
         let mut results = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
+        let query_lower = query.to_lowercase();
 
         // 1. Search Pending Buffer First
         if let Ok(pending_sessions) = self.get_pending_sessions() {
@@ -559,7 +643,7 @@ impl Storage {
 
                 let mut found = false;
                 for msg in &s.messages {
-                    if msg.content.to_lowercase().contains(&query.to_lowercase()) {
+                    if msg.content.to_lowercase().contains(&query_lower) {
                         found = true;
                         break;
                     }
@@ -571,86 +655,118 @@ impl Storage {
             }
         }
 
-        if !path.exists() {
+        // 2. Search every archived segment (oldest → newest). Previously this
+        //    only looked at the latest segment, so after a 1 GB rotation older
+        //    data became invisible to search.
+        let segments = self.list_segments();
+        if segments.is_empty() {
             return Ok(results);
         }
 
-        if !index_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Index file not found. Please run: cryo reindex"
-            ));
-        }
-
-        let mut file = File::open(&path)?;
-        let mut idx_file = File::open(&index_path)?;
-
-        let mut magic_buf = [0u8; 8];
-        file.read_exact(&mut magic_buf)?;
-        if magic_buf != DATA_MAGIC {
-            return Err(anyhow::anyhow!("Invalid file format"));
-        }
-
-        loop {
-            let mut idx_size_buf = [0u8; 4];
-            let n = idx_file.read(&mut idx_size_buf)?;
-            if n == 0 {
-                break;
-            } // Clean EOF
-            if n < 4 {
-                idx_file.read_exact(&mut idx_size_buf[n..])?;
-            }
-            let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
-
-            let mut compressed_idx_buf = vec![0u8; idx_size];
-            idx_file.read_exact(&mut compressed_idx_buf)?;
-
-            let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
-            let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
-
-            let mut size_buf = [0u8; 4];
-            file.read_exact(&mut size_buf)?;
-            let size = u32::from_le_bytes(size_buf) as usize;
-
-            if let Some(after_ts) = after
-                && index.max_time < after_ts
-            {
-                file.seek(io::SeekFrom::Current(size as i64))?;
+        for (path, index_path, _seg) in segments {
+            if !path.exists() {
                 continue;
             }
-            if let Some(before_ts) = before
-                && index.min_time > before_ts
-            {
-                file.seek(io::SeekFrom::Current(size as i64))?;
-                continue;
+            if !index_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Index file not found for segment {}. Please run: cryo reindex",
+                    path.display()
+                ));
             }
 
-            if index.matches(query) {
-                let mut compressed_buf = vec![0u8; size];
-                file.read_exact(&mut compressed_buf)?;
+            let mut file = File::open(&path)?;
+            let mut idx_file = File::open(&index_path)?;
 
-                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+            let mut magic_buf = [0u8; 8];
+            file.read_exact(&mut magic_buf)?;
+            if magic_buf != DATA_MAGIC {
+                return Err(anyhow::anyhow!(
+                    "Invalid file format in {}",
+                    path.display()
+                ));
+            }
 
-                let sessions = match wrapper {
-                    StoredSession::V1(s) => vec![s],
-                    StoredSession::Block(sessions) => sessions,
-                    StoredSession::V2(block) => block.sessions,
-                };
-                for s in sessions {
-                    let mut found = false;
-                    for msg in &s.messages {
-                        if msg.content.to_lowercase().contains(&query.to_lowercase()) {
-                            found = true;
-                            break;
+            loop {
+                let mut idx_size_buf = [0u8; 4];
+                let n = idx_file.read(&mut idx_size_buf)?;
+                if n == 0 {
+                    break;
+                } // Clean EOF
+                if n < 4 {
+                    idx_file.read_exact(&mut idx_size_buf[n..])?;
+                }
+                let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
+
+                let mut compressed_idx_buf = vec![0u8; idx_size];
+                idx_file.read_exact(&mut compressed_idx_buf)?;
+
+                let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
+                let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
+
+                let mut size_buf = [0u8; 4];
+                file.read_exact(&mut size_buf)?;
+                let size = u32::from_le_bytes(size_buf) as usize;
+
+                if let Some(after_ts) = after
+                    && index.max_time < after_ts
+                {
+                    file.seek(io::SeekFrom::Current(size as i64))?;
+                    continue;
+                }
+                if let Some(before_ts) = before
+                    && index.min_time > before_ts
+                {
+                    file.seek(io::SeekFrom::Current(size as i64))?;
+                    continue;
+                }
+
+                if index.matches(query) {
+                    let mut compressed_buf = vec![0u8; size];
+                    file.read_exact(&mut compressed_buf)?;
+
+                    let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+                    let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+
+                    let sessions = match wrapper {
+                        StoredSession::V1(s) => vec![s],
+                        StoredSession::Block(sessions) => sessions,
+                        StoredSession::V2(block) => block.sessions,
+                    };
+                    for s in sessions {
+                        // Per-session time filter — block-level min/max can let
+                        // sessions outside the requested range slip through when a
+                        // block straddles the boundary or contains sessions with
+                        // no `created_at`.
+                        if let Some(after_ts) = after {
+                            if let Some(ct) = s.created_at {
+                                if ct < after_ts {
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Some(before_ts) = before {
+                            if let Some(ct) = s.created_at {
+                                if ct > before_ts {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let mut found = false;
+                        for msg in &s.messages {
+                            if msg.content.to_lowercase().contains(&query_lower) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found && !seen_ids.contains(&s.id) {
+                            seen_ids.insert(s.id.clone());
+                            results.push(s);
                         }
                     }
-                    if found && !seen_ids.contains(&s.id) {
-                        seen_ids.insert(s.id.clone());
-                        results.push(s);
-                    }
+                } else {
+                    file.seek(std::io::SeekFrom::Current(size as i64))?;
                 }
-            } else {
-                file.seek(std::io::SeekFrom::Current(size as i64))?;
             }
         }
 
@@ -658,61 +774,68 @@ impl Storage {
         Ok(results)
     }
 
-    /// Reads all sessions from the file (Scan).
+    /// Reads all sessions from every segment on disk (oldest → newest)
+    /// plus the pending buffer.
     ///
-    /// Checks magic bytes and iterates through all blocks in the file.
+    /// Pending sessions are prepended in their WAL order so callers that
+    /// take "last N" still see the freshest activity.
     pub fn scan_all(&self) -> Result<Vec<ChatSessionV1>> {
-        let path = self.get_active_file();
         let mut sessions = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
+        // Archive first (chronological), pending appended last so the freshest
+        // entries land at the end of the vector — preserving the long-standing
+        // "last N = most recent activity" assumption used by `cryo last` /
+        // `get_recent_sessions`.
+        for (data_path, _index_path, _seg) in self.list_segments() {
+            if !data_path.exists() {
+                continue;
+            }
+
+            let mut file = File::open(&data_path)?;
+
+            let mut magic_buf = [0u8; 8];
+            file.read_exact(&mut magic_buf)?;
+            if magic_buf != DATA_MAGIC {
+                return Err(anyhow::anyhow!(
+                    "Invalid file format: Wrong Magic Bytes in {}",
+                    data_path.display()
+                ));
+            }
+
+            loop {
+                let mut size_buf = [0u8; 4];
+                let n = file.read(&mut size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    file.read_exact(&mut size_buf[n..])?;
+                }
+                let size = u32::from_le_bytes(size_buf) as usize;
+
+                let mut compressed_buf = vec![0u8; size];
+                file.read_exact(&mut compressed_buf)?;
+
+                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+
+                let block_sessions = match wrapper {
+                    StoredSession::V1(s) => vec![s],
+                    StoredSession::Block(sessions) => sessions,
+                    StoredSession::V2(block) => block.sessions,
+                };
+                for s in block_sessions {
+                    if !seen_ids.contains(&s.id) {
+                        seen_ids.insert(s.id.clone());
+                        sessions.push(s);
+                    }
+                }
+            }
+        }
+
         if let Ok(pending) = self.get_pending_sessions() {
             for s in pending {
-                seen_ids.insert(s.id.clone());
-                sessions.push(s);
-            }
-        }
-
-        if !path.exists() {
-            return Ok(sessions);
-        }
-
-        let mut file = File::open(&path)?;
-
-        let mut magic_buf = [0u8; 8];
-        file.read_exact(&mut magic_buf)?;
-        if magic_buf != DATA_MAGIC {
-            return Err(anyhow::anyhow!("Invalid file format: Wrong Magic Bytes"));
-        }
-
-        loop {
-            // Read Size (u32)
-            let mut size_buf = [0u8; 4];
-            let n = file.read(&mut size_buf)?;
-            if n == 0 {
-                break;
-            }
-            if n < 4 {
-                file.read_exact(&mut size_buf[n..])?;
-            }
-            let size = u32::from_le_bytes(size_buf) as usize;
-
-            // Read Compressed Body
-            let mut compressed_buf = vec![0u8; size];
-            file.read_exact(&mut compressed_buf)?;
-
-            // Decompress
-            let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-
-            // Deserialize Bincode -> StoredSession
-            let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
-
-            let block_sessions = match wrapper {
-                StoredSession::V1(s) => vec![s],
-                StoredSession::Block(sessions) => sessions,
-                StoredSession::V2(block) => block.sessions,
-            };
-            for s in block_sessions {
                 if !seen_ids.contains(&s.id) {
                     seen_ids.insert(s.id.clone());
                     sessions.push(s);
@@ -736,79 +859,81 @@ impl Storage {
         self.get_archived_session_by_id(session_id)
     }
 
-    /// Internal helper that checks only the persistent archive files, skipping pending.bin
+    /// Internal helper that checks only the persistent archive files, skipping pending.bin.
+    /// Iterates every segment so sessions written before rotation remain reachable.
     fn get_archived_session_by_id(&self, session_id: &str) -> Result<Option<ChatSessionV1>> {
-        let path = self.get_active_file();
-        let index_path = self.get_index_file();
-
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        if !index_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Index file not found. Please run: cryo reindex"
-            ));
-        }
-
-        // Read all index entries and build ID map
-        let mut idx_file = File::open(&index_path)?;
-
-        loop {
-            let mut idx_size_buf = [0u8; 4];
-            let n = idx_file.read(&mut idx_size_buf)?;
-            if n == 0 {
-                break;
+        for (path, index_path, _seg) in self.list_segments() {
+            if !path.exists() {
+                continue;
             }
-            if n < 4 {
-                idx_file.read_exact(&mut idx_size_buf[n..])?;
+            if !index_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Index file not found for segment {}. Please run: cryo reindex",
+                    path.display()
+                ));
             }
-            let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
 
-            let mut compressed_idx_buf = vec![0u8; idx_size];
-            idx_file.read_exact(&mut compressed_idx_buf)?;
+            let mut idx_file = File::open(&index_path)?;
 
-            // Decompress index
-            let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
-            let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
+            loop {
+                let mut idx_size_buf = [0u8; 4];
+                let n = idx_file.read(&mut idx_size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    idx_file.read_exact(&mut idx_size_buf[n..])?;
+                }
+                let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
 
-            if index.session_id.split(',').any(|id| id == session_id) {
-                // Found it! Now read the specific block
-                let mut data_file = File::open(&path)?;
+                let mut compressed_idx_buf = vec![0u8; idx_size];
+                idx_file.read_exact(&mut compressed_idx_buf)?;
 
-                // Seek to the block
-                data_file.seek(io::SeekFrom::Start(index.data_offset))?;
+                let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
+                let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
 
-                // Read size header
-                let mut size_buf = [0u8; 4];
-                data_file.read_exact(&mut size_buf)?;
-                let size = u32::from_le_bytes(size_buf) as usize;
+                if index.session_id.split(',').any(|id| id == session_id) {
+                    let mut data_file = File::open(&path)?;
 
-                // Read compressed block
-                let mut compressed_buf = vec![0u8; size];
-                data_file.read_exact(&mut compressed_buf)?;
+                    data_file.seek(io::SeekFrom::Start(index.data_offset))?;
 
-                // Decompress and deserialize
-                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+                    let mut size_buf = [0u8; 4];
+                    data_file.read_exact(&mut size_buf)?;
+                    let size = u32::from_le_bytes(size_buf) as usize;
 
-                return match wrapper {
-                    StoredSession::V1(s) => {
-                        if s.id == session_id {
-                            Ok(Some(s))
-                        } else {
-                            Ok(None)
+                    let mut compressed_buf = vec![0u8; size];
+                    data_file.read_exact(&mut compressed_buf)?;
+
+                    let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+                    let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+
+                    return match wrapper {
+                        StoredSession::V1(s) => {
+                            if s.id == session_id {
+                                Ok(Some(s))
+                            } else {
+                                // Bloom false positive on a single-session block — keep scanning.
+                                continue;
+                            }
                         }
-                    }
-                    StoredSession::Block(sessions) => {
-                        Ok(sessions.into_iter().find(|s| s.id == session_id))
-                    }
-                    StoredSession::V2(block) => {
-                        Ok(block.sessions.into_iter().find(|s| s.id == session_id))
-                    }
-                };
-            }
-        }
+                        StoredSession::Block(sessions) => {
+                            if let Some(s) = sessions.into_iter().find(|s| s.id == session_id) {
+                                Ok(Some(s))
+                            } else {
+                                continue;
+                            }
+                        }
+                        StoredSession::V2(block) => {
+                            if let Some(s) = block.sessions.into_iter().find(|s| s.id == session_id) {
+                                Ok(Some(s))
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                } // end `if index matches`
+            } // end inner loop over index entries
+        } // end for over segments
 
         Ok(None)
     }
@@ -822,15 +947,30 @@ impl Storage {
     /// 5. Rename temp file to actual index file.
     pub fn reindex(&self) -> Result<usize> {
         debug!("Starting reindex operation");
-        let path = self.get_active_file();
-        let index_path = self.get_index_file();
-        let temp_index_path = index_path.with_extension("cryo.tmp");
 
-        if !path.exists() {
+        let segments = self.list_segments();
+        if segments.is_empty() {
             return Err(StorageError::DataFileNotFound.into());
         }
 
-        let mut file = File::open(&path)?;
+        let mut total_count = 0usize;
+
+        for (path, index_path, _seg) in segments {
+            if !path.exists() {
+                continue;
+            }
+            total_count += self.reindex_segment(&path, &index_path)?;
+        }
+
+        debug!(sessions_indexed = total_count, "Reindex completed");
+        Ok(total_count)
+    }
+
+    /// Rebuilds the index for a single segment atomically (temp file → rename).
+    fn reindex_segment(&self, path: &PathBuf, index_path: &PathBuf) -> Result<usize> {
+        let temp_index_path = index_path.with_extension("cryo.tmp");
+
+        let mut file = File::open(path)?;
 
         let mut idx_file = OpenOptions::new()
             .create(true)
@@ -838,20 +978,20 @@ impl Storage {
             .truncate(true)
             .open(&temp_index_path)?;
 
-        // Check Magic
         let mut magic_buf = [0u8; 8];
         file.read_exact(&mut magic_buf)?;
         if magic_buf != DATA_MAGIC {
-            return Err(anyhow::anyhow!("Invalid file format"));
+            return Err(anyhow::anyhow!(
+                "Invalid file format in {}",
+                path.display()
+            ));
         }
 
         let mut count = 0;
 
         loop {
-            // Track offset BEFORE reading size (current position)
             let data_offset = file.stream_position()?;
 
-            // Read Size
             let mut size_buf = [0u8; 4];
             let n = file.read(&mut size_buf)?;
             if n == 0 {
@@ -862,37 +1002,24 @@ impl Storage {
             }
             let compressed_size = u32::from_le_bytes(size_buf);
 
-            // Read Compressed Block
             let mut compressed_buf = vec![0u8; compressed_size as usize];
             file.read_exact(&mut compressed_buf)?;
 
-            // Decompress and extract metadata
             let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
             let build_block_index_and_len = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
                 let mut full_text = String::new();
-                let mut min_time = u64::MAX;
-                let mut max_time = 0;
                 let mut message_count = 0;
                 let mut session_ids = Vec::new();
 
                 for session in sessions {
                     session_ids.push(session.id.clone());
                     full_text.push_str(&session.extract_full_text());
-
-                    let created = session.created_at.unwrap_or(0);
-                    if created < min_time {
-                        min_time = created;
-                    }
-                    if created > max_time {
-                        max_time = created;
-                    }
                     message_count += session.messages.len() as u32;
                 }
-                if min_time == u64::MAX {
-                    min_time = 0;
-                }
+
+                let (min_time, max_time) = compute_block_time_range(sessions);
 
                 let entry = crate::index::BlockIndex::new(
                     session_ids.join(","),
@@ -911,7 +1038,6 @@ impl Storage {
 
             match wrapper {
                 StoredSession::V1(session) => {
-                    // Extract content
                     let full_text = session.extract_full_text();
 
                     let min_time = session.created_at.unwrap_or(0);
@@ -930,7 +1056,6 @@ impl Storage {
                         },
                     );
 
-                    // Stream to temp file
                     let index_bytes = bincode::serialize(&index_entry)?;
                     let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
                     let idx_size = compressed_index.len() as u32;
@@ -962,13 +1087,11 @@ impl Storage {
             }
         }
 
-        // Finalize
         idx_file.sync_all()?;
-        drop(idx_file); // Ensure closed before rename
+        drop(idx_file);
 
-        fs::rename(temp_index_path, index_path)?;
+        fs::rename(&temp_index_path, index_path)?;
 
-        debug!(sessions_indexed = count, "Reindex completed");
         Ok(count)
     }
 
@@ -1006,91 +1129,103 @@ impl Storage {
             stats.total_size_bytes += fs::metadata(&pending_path)?.len();
         }
 
-        let path = self.get_active_file();
-        if !path.exists() {
+        // Iterate every segment — previously this only counted the latest
+        // segment, so once rotation triggered all older data was missing
+        // from `cryo stats`.
+        let segments = self.list_segments();
+        if segments.is_empty() {
             return Ok(stats);
         }
-        stats.total_size_bytes += fs::metadata(&path)?.len();
 
-        let index_path = self.get_index_file();
-        if index_path.exists() {
-            let mut idx_file = File::open(&index_path)?;
+        for (path, index_path, _seg) in &segments {
+            if !path.exists() {
+                continue;
+            }
+            stats.total_size_bytes += fs::metadata(path)?.len();
+
+            if index_path.exists() {
+                let mut idx_file = File::open(index_path)?;
+                loop {
+                    let mut idx_size_buf = [0u8; 4];
+                    let n = idx_file.read(&mut idx_size_buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    if n < 4 {
+                        idx_file.read_exact(&mut idx_size_buf[n..])?;
+                    }
+                    let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
+
+                    let mut compressed_idx_buf = vec![0u8; idx_size];
+                    idx_file.read_exact(&mut compressed_idx_buf)?;
+
+                    let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
+                    let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
+
+                    // Each index entry can represent multiple sessions (Block / V2),
+                    // joined by ',' in `session_id`. Counting +=1 here would report
+                    // block count instead of session count.
+                    stats.session_count += count_sessions_in_index_id(&index.session_id);
+                    stats.message_count += index.message_count as u64;
+                    stats.data_compressed_bytes += index.compressed_size as u64;
+                    stats.data_uncompressed_bytes += index.uncompressed_size as u64;
+
+                    if index.min_time > 0
+                        && (stats.min_time == 0 || index.min_time < stats.min_time)
+                    {
+                        stats.min_time = index.min_time;
+                    }
+                    if index.max_time != u64::MAX && index.max_time > stats.max_time {
+                        stats.max_time = index.max_time;
+                    }
+                }
+                continue; // Move on to the next segment.
+            }
+
+            // Index missing for this segment — fall back to a slow data scan.
+            let mut file = File::open(path)?;
+
+            let mut magic_buf = [0u8; 8];
+            file.read_exact(&mut magic_buf)?;
+            if magic_buf != DATA_MAGIC {
+                return Err(anyhow::anyhow!(
+                    "Invalid file format in {}",
+                    path.display()
+                ));
+            }
+
             loop {
-                let mut idx_size_buf = [0u8; 4];
-                let n = idx_file.read(&mut idx_size_buf)?;
+                let mut size_buf = [0u8; 4];
+                let n = file.read(&mut size_buf)?;
                 if n == 0 {
                     break;
                 }
                 if n < 4 {
-                    idx_file.read_exact(&mut idx_size_buf[n..])?;
+                    file.read_exact(&mut size_buf[n..])?;
                 }
-                let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
+                let compressed_size = u32::from_le_bytes(size_buf) as usize;
+                stats.data_compressed_bytes += compressed_size as u64;
 
-                let mut compressed_idx_buf = vec![0u8; idx_size];
-                idx_file.read_exact(&mut compressed_idx_buf)?;
+                let mut compressed_buf = vec![0u8; compressed_size];
+                file.read_exact(&mut compressed_buf)?;
 
-                let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
-                let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
+                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
+                stats.data_uncompressed_bytes += raw_bytes.len() as u64;
 
-                stats.session_count += 1;
-                stats.message_count += index.message_count as u64;
-                stats.data_compressed_bytes += index.compressed_size as u64;
-                stats.data_uncompressed_bytes += index.uncompressed_size as u64;
-
-                if index.min_time > 0 && (stats.min_time == 0 || index.min_time < stats.min_time) {
-                    stats.min_time = index.min_time;
-                }
-                if index.max_time != u64::MAX && index.max_time > stats.max_time {
-                    stats.max_time = index.max_time;
-                }
-            }
-            return Ok(stats);
-        }
-
-        let mut file = File::open(&path)?;
-
-        // Check Magic
-        let mut magic_buf = [0u8; 8];
-        file.read_exact(&mut magic_buf)?;
-        if magic_buf != DATA_MAGIC {
-            return Err(anyhow::anyhow!("Invalid file format"));
-        }
-
-        loop {
-            // Read Size (u32)
-            let mut size_buf = [0u8; 4];
-            let n = file.read(&mut size_buf)?;
-            if n == 0 {
-                break;
-            }
-            if n < 4 {
-                file.read_exact(&mut size_buf[n..])?;
-            }
-            let compressed_size = u32::from_le_bytes(size_buf) as usize;
-            stats.data_compressed_bytes += compressed_size as u64;
-
-            // Read Compressed Body
-            let mut compressed_buf = vec![0u8; compressed_size];
-            file.read_exact(&mut compressed_buf)?;
-
-            // Decompress
-            let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-            stats.data_uncompressed_bytes += raw_bytes.len() as u64;
-
-            // Deserialize
-            let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
-            match wrapper {
-                StoredSession::V1(s) => {
-                    stats.accumulate_session(&s);
-                }
-                StoredSession::Block(block_sessions) => {
-                    for s in &block_sessions {
-                        stats.accumulate_session(s);
+                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
+                match wrapper {
+                    StoredSession::V1(s) => {
+                        stats.accumulate_session(&s);
                     }
-                }
-                StoredSession::V2(block) => {
-                    for s in &block.sessions {
-                        stats.accumulate_session(s);
+                    StoredSession::Block(block_sessions) => {
+                        for s in &block_sessions {
+                            stats.accumulate_session(s);
+                        }
+                    }
+                    StoredSession::V2(block) => {
+                        for s in &block.sessions {
+                            stats.accumulate_session(s);
+                        }
                     }
                 }
             }
@@ -1177,15 +1312,26 @@ impl Storage {
                 on_session(1);
                 chunk_sessions.push(session);
 
-                let wrapper = if chunk_sessions.len() == 1 {
+                // Cheap gate: skip trial-compression until the *uncompressed*
+                // bincode size is plausibly above target. zstd on chat text
+                // achieves ~3–5× compression at level 19, so we only start
+                // trial-compressing once raw size is > 2× target. This keeps
+                // optimise roughly O(N) instead of O(N²) of re-compressions
+                // of the growing chunk.
+                let raw = bincode::serialize(&if chunk_sessions.len() == 1 {
                     StoredSession::V1(chunk_sessions[0].clone())
                 } else {
                     StoredSession::Block(chunk_sessions.clone())
-                };
+                })?;
 
-                let raw = bincode::serialize(&wrapper)?;
-                // Performance: use fast Zstd level 1 for trial compression size check
-                let compressed = zstd::encode_all(&raw[..], 1)?;
+                if raw.len() < target_bytes * 2 {
+                    continue;
+                }
+
+                // Use the SAME level we actually write at (19), otherwise the
+                // size check is based on a much larger trial output and the
+                // emitted blocks come out 2–3× smaller than `target_bytes`.
+                let compressed = zstd::encode_all(&raw[..], 19)?;
 
                 if compressed.len() > target_bytes && chunk_sessions.len() > 1 {
                     let last = chunk_sessions.pop().expect("chunk has at least one session");

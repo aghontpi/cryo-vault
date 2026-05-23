@@ -73,26 +73,16 @@ impl SessionWriter {
 
         let build_block_index = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
             let mut full_text = String::new();
-            let mut min_time = u64::MAX;
-            let mut max_time = 0;
             let mut message_count = 0;
             let mut session_ids = Vec::new();
 
             for session in sessions {
                 session_ids.push(session.id.clone());
                 full_text.push_str(&session.extract_full_text());
-                let created = session.created_at.unwrap_or(0);
-                if created < min_time {
-                    min_time = created;
-                }
-                if created > max_time {
-                    max_time = created;
-                }
                 message_count += session.messages.len() as u32;
             }
-            if min_time == u64::MAX {
-                min_time = 0;
-            }
+
+            let (min_time, max_time) = crate::storage::compute_block_time_range(sessions);
 
             crate::index::BlockIndex::new(
                 session_ids.join(","),
