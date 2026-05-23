@@ -28,8 +28,41 @@ A high-performance, highly compressed database for storing chat conversations ir
 
 ## Getting Started
 
-### 1. Building
-Cryo Vault produces two binaries: one for CLI usage and one for MCP integration.
+### 1. Install (recommended)
+
+A one-shot installer is provided for each major platform. It detects your OS / arch, drops the binaries under `~/.cryo-vault/versions/<version>/`, symlinks (or shims, on Windows) `cryo` and `cryo-vault-mcp` into `~/.cryo-vault/bin`, and wires that directory onto your `PATH` so typing `cryo` from any new terminal Just Works.
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+iwr -useb https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.ps1 | iex
+```
+
+Or, after cloning the repo:
+```bash
+./install.sh           # macOS / Linux
+./install.ps1          # Windows
+```
+
+The installer is idempotent: re-running it upgrades to the latest version and removes any prior install it finds. Useful flags:
+
+| Flag (bash / pwsh) | Purpose |
+| :--- | :--- |
+| `--version v0.2.0` / `-Version v0.2.0` | Pin a specific release. |
+| `--prefix <path>` / `-Prefix <path>` | Change the install location (default `~/.cryo-vault`). |
+| `--source local\|github` / `-Source local\|github` | Force the binary source. Auto-detects `dist/` when run from a clone. |
+| `--force` / `-Force` | Reinstall even if the same version is already present. |
+| `--uninstall` / `-Uninstall` | Remove the install and clean the PATH entry. |
+| `--no-path` / `-NoPath` | Skip editing your shell rc / user PATH. |
+
+After install, `cryo --help` works from any new shell. The MCP server is available as `cryo-vault-mcp` on the same `PATH` — see [C. MCP Server Usage](#c-mcp-server-usage-for-ai) below.
+
+### 2. Building from source
+If you'd rather build it yourself, Cryo Vault produces two binaries:
 
 ```bash
 cargo build --release
