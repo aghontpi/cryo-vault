@@ -1,0 +1,44 @@
+@startuml Search with Time Range
+
+User -> CLI: cryo search "dentist"\n  --after 2024-01-01\n  --before 2024-12-31
+
+CLI -> CLI: parse_date("2024-01-01")\n→ 1704067200
+
+CLI -> Storage: search(query, after_ts, before_ts)
+activate Storage
+
+Storage -> IndexFile: open(index_001.cryo)
+activate IndexFile
+
+loop for each index entry
+    IndexFile -> Storage: read(compressed_index)
+    Storage -> Storage: decompress(index)
+    Storage -> Storage: deserialize(BlockIndex)
+    
+    alt Time range check FAILS
+        Storage -> Storage: skip block\n[seek forward]
+    else Time range OK + Bloom match
+        Storage -> DataFile: seek(offset)\nread(size)
+        activate DataFile
+        DataFile --> Storage: compressed_data
+        deactivate DataFile
+        
+        Storage -> Storage: decompress()
+        Storage -> Storage: deserialize as StoredSession\n(V1 | Block | V2)
+        Storage -> Storage: verify_content()\n[false positive check]
+        
+        alt content matches
+            Storage -> Storage: add to results
+        end
+    end
+end
+
+IndexFile --> Storage: EOF
+deactivate IndexFile
+
+Storage --> CLI: Vec<Session>
+deactivate Storage
+
+CLI --> User: [72d313..] Dentist at 4:30\n[29a9dc..]
+
+@enduml

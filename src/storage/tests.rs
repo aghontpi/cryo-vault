@@ -117,14 +117,18 @@ fn test_writer_rotation_explicit() {
 
     // Write session 1 (should fit or be close)
     let s1 = create_dummy_session("s1", 1);
-    writer.append(s1).expect("Failed to append s1");
+    writer
+        .append(StoredSession::V1(s1))
+        .expect("Failed to append s1");
 
     // Write session 2 (should trigger rotation if s1 + s2 > 100 bytes)
     // A session with 1 message is around ~80-100 bytes compressed/serialized usually.
     // Let's force it by writing a few.
     for i in 2..5 {
         let s = create_dummy_session(&format!("s{}", i), 1);
-        writer.append(s).expect("Failed to append");
+        writer
+            .append(StoredSession::V1(s))
+            .expect("Failed to append");
     }
 
     writer.flush().expect("Failed to flush");
@@ -419,6 +423,179 @@ fn test_flush_pending_empty_file() {
     // Flush when no pending file exists
     let archived = storage.flush_pending().unwrap();
     assert_eq!(archived, 0);
+}
+
+/// Sessions stored across multiple segments must remain visible to
+/// `scan_all`, `search`, `get_session_by_id`, `get_stats`, and `reindex`.
+/// Before the multi-segment fix, all of these only inspected the latest
+/// segment, so once rotation triggered older data became silently invisible.
+#[test]
+fn test_multi_segment_visibility() {
+    let (storage, _temp) = create_test_storage();
+    let data_dir = _temp.path().to_path_buf();
+
+    // Manually craft segments by driving the writer with a tiny max_size.
+    let data_path_1 = data_dir.join("data_001.cryo");
+    let index_path_1 = data_dir.join("index_001.cryo");
+    let data_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&data_path_1)
+        .unwrap();
+    let index_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index_path_1)
+        .unwrap();
+    // Seed magic so reads succeed.
+    let mut seed = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&data_path_1)
+        .unwrap();
+    seed.write_all(constants::DATA_MAGIC).unwrap();
+    drop(seed);
+
+    let mut writer = SessionWriter::new(
+        data_dir.clone(),
+        1,
+        data_file,
+        index_file,
+        // Tiny max so rotation triggers after a few sessions.
+        200,
+    )
+    .unwrap();
+
+    let mut s_old = create_dummy_session("seg1-session", 2);
+    s_old.created_at = Some(1000);
+    writer.append(StoredSession::V1(s_old)).unwrap();
+
+    // Force enough writes to trigger rotation to segment 2.
+    for i in 0..6 {
+        let mut s = create_dummy_session(&format!("padding-{}", i), 1);
+        s.created_at = Some(2000 + i as u64);
+        writer.append(StoredSession::V1(s)).unwrap();
+    }
+    writer.flush().unwrap();
+
+    assert!(
+        data_dir.join("data_002.cryo").exists(),
+        "Test setup: rotation must have produced data_002.cryo"
+    );
+
+    // Reindex must rebuild every segment's index — not just the active one.
+    let reindexed = storage.reindex().unwrap();
+    assert!(reindexed >= 7, "Reindex should cover all segments");
+    assert!(data_dir.join("index_001.cryo").exists());
+    assert!(data_dir.join("index_002.cryo").exists());
+
+    // get_session_by_id must find a session that lives in segment 1.
+    let fetched = storage.get_session_by_id("seg1-session").unwrap();
+    assert!(
+        fetched.is_some(),
+        "Session in older segment must remain reachable after rotation"
+    );
+
+    // scan_all must include every segment.
+    let all = storage.scan_all().unwrap();
+    assert!(all.iter().any(|s| s.id == "seg1-session"));
+    assert!(all.iter().any(|s| s.id == "padding-0"));
+    assert!(all.iter().any(|s| s.id == "padding-5"));
+
+    // search must cross segments.
+    let hits = storage.search("seg1-session", None, None).unwrap();
+    assert!(hits.iter().any(|s| s.id == "seg1-session"));
+
+    // get_stats must aggregate counts across segments, not just the latest.
+    let stats = storage.get_stats().unwrap();
+    assert_eq!(
+        stats.session_count, 7,
+        "Stats must include sessions in every segment, got {}",
+        stats.session_count
+    );
+}
+
+/// Search must filter sessions individually by `created_at`, even when they
+/// share a Block index entry whose [min_time, max_time] straddles the
+/// requested [after, before] window.
+#[test]
+fn test_search_time_filter_refines_within_block() {
+    let (storage, _temp) = create_test_storage();
+
+    let mut early = create_dummy_session("inside-early", 1);
+    early.created_at = Some(100);
+    let mut middle = create_dummy_session("inside-middle", 1);
+    middle.created_at = Some(500);
+    let mut late = create_dummy_session("inside-late", 1);
+    late.created_at = Some(900);
+
+    // Bulk-append produces a single multi-session Block whose index range is
+    // [100, 900] — overlaps [200, 800] so the block passes the gate, then the
+    // per-session filter must drop `early` and `late`.
+    storage
+        .append_bulk(vec![early, middle, late])
+        .expect("append_bulk failed");
+
+    let hits = storage
+        .search("Message", Some(200), Some(800))
+        .expect("Search failed");
+    assert_eq!(
+        hits.len(),
+        1,
+        "Per-session filter must drop sessions outside [200, 800]; got {:?}",
+        hits.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+    assert_eq!(hits[0].id, "inside-middle");
+}
+
+/// `get_stats` (index-fast-path) must count sessions, not blocks.
+/// A multi-session Block index entry must contribute N sessions to the total.
+#[test]
+fn test_stats_counts_sessions_inside_blocks() {
+    let (storage, _temp) = create_test_storage();
+
+    let s1 = create_dummy_session("a", 1);
+    let s2 = create_dummy_session("b", 2);
+    let s3 = create_dummy_session("c", 3);
+
+    // append_bulk packs all three into one block.
+    storage
+        .append_bulk(vec![s1, s2, s3])
+        .expect("append_bulk failed");
+
+    let stats = storage.get_stats().expect("stats failed");
+    assert_eq!(
+        stats.session_count, 3,
+        "Stats must report 3 sessions across the block, not 1 (block count)"
+    );
+    assert_eq!(stats.message_count, 6);
+}
+
+/// A session with no `created_at` bundled into a Block must still surface in
+/// a time-filtered search. (Pre-fix: block min/max collapsed to 0 and the
+/// after-filter excluded the whole block.)
+#[test]
+fn test_search_includes_block_sessions_without_created_at() {
+    let (storage, _temp) = create_test_storage();
+
+    let mut undated = create_dummy_session("undated", 1);
+    undated.created_at = None;
+    let mut dated = create_dummy_session("dated", 1);
+    dated.created_at = Some(5_000);
+
+    storage
+        .append_bulk(vec![undated, dated])
+        .expect("append_bulk failed");
+
+    let hits = storage
+        .search("Message", Some(1_000), None)
+        .expect("search failed");
+    // Both must surface: dated by virtue of created_at >= 1000, undated
+    // because it has no timestamp the filter could exclude it on.
+    assert!(hits.iter().any(|s| s.id == "dated"));
+    assert!(
+        hits.iter().any(|s| s.id == "undated"),
+        "Block sessions with no created_at must still be reachable by time-filtered search"
+    );
 }
 
 #[test]

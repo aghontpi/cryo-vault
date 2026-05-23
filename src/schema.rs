@@ -5,10 +5,17 @@ use uuid::Uuid;
 
 /// The top-level storage wrapper. This is what we write to disk.
 /// It uses a single byte tag (0, 1, 2...) to determine the version.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum StoredSession {
     V1(ChatSessionV1),
-    // Future: V2(ChatSessionV2)
+    Block(Vec<ChatSessionV1>),
+    V2(SessionBlockV2),
+}
+
+/// Chunked block containing multiple sessions.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionBlockV2 {
+    pub sessions: Vec<ChatSessionV1>,
 }
 
 /// The Input DTO (V1).
@@ -85,6 +92,17 @@ impl From<ChatSessionInput> for ChatSessionV1 {
             metadata_json: serde_json::to_string(&input.metadata).unwrap_or_default(),
             messages: input.messages.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+impl ChatSessionV1 {
+    pub fn extract_full_text(&self) -> String {
+        let mut full_text = String::new();
+        for msg in &self.messages {
+            full_text.push_str(&msg.content);
+            full_text.push(' ');
+        }
+        full_text
     }
 }
 
