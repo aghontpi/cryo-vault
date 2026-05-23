@@ -993,6 +993,18 @@ impl Storage {
     /// 4. Writes index entries to the temp file.
     /// 5. Rename temp file to actual index file.
     pub fn reindex(&self) -> Result<usize> {
+        self.reindex_with_progress(|| {})
+    }
+
+    /// Reindex with a per-block progress callback.
+    ///
+    /// `on_block` fires once per data block successfully indexed (paired
+    /// with [`count_archive_blocks`] as the bar denominator). Callers that
+    /// don't care can pass `|| {}`.
+    pub fn reindex_with_progress<F>(&self, mut on_block: F) -> Result<usize>
+    where
+        F: FnMut(),
+    {
         debug!("Starting reindex operation");
 
         let segments = self.list_segments();
@@ -1006,15 +1018,61 @@ impl Storage {
             if !path.exists() {
                 continue;
             }
-            total_count += self.reindex_segment(&path, &index_path)?;
+            total_count += self.reindex_segment(&path, &index_path, &mut on_block)?;
         }
 
         debug!(sessions_indexed = total_count, "Reindex completed");
         Ok(total_count)
     }
 
+    /// Total number of compressed blocks across every archive segment.
+    ///
+    /// Reads only the 4-byte size headers and seeks past each block payload,
+    /// so this is O(blocks) reads with no decompression. Useful as a
+    /// progress-bar denominator for `reindex`, where the existing index is
+    /// untrustworthy and `stats` would lie.
+    pub fn count_archive_blocks(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for (path, _index_path, _seg) in self.list_segments() {
+            if !path.exists() {
+                continue;
+            }
+            let mut file = File::open(&path)?;
+            let mut magic = [0u8; 8];
+            file.read_exact(&mut magic)?;
+            if magic != DATA_MAGIC {
+                return Err(anyhow::anyhow!(
+                    "Invalid file format in {}",
+                    path.display()
+                ));
+            }
+            loop {
+                let mut size_buf = [0u8; 4];
+                let n = file.read(&mut size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    file.read_exact(&mut size_buf[n..])?;
+                }
+                let size = u32::from_le_bytes(size_buf) as i64;
+                file.seek(io::SeekFrom::Current(size))?;
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
+
     /// Rebuilds the index for a single segment atomically (temp file → rename).
-    fn reindex_segment(&self, path: &PathBuf, index_path: &PathBuf) -> Result<usize> {
+    fn reindex_segment<F>(
+        &self,
+        path: &PathBuf,
+        index_path: &PathBuf,
+        on_block: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(),
+    {
         let temp_index_path = index_path.with_extension("cryo.tmp");
 
         let mut file = File::open(path)?;
@@ -1110,6 +1168,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += 1;
+                    on_block();
                 }
                 StoredSession::Block(sessions) => {
                     let (index_entry, sessions_len) = build_block_index_and_len(&sessions, data_offset, compressed_size, raw_bytes.len() as u32);
@@ -1120,6 +1179,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += sessions_len;
+                    on_block();
                 }
                 StoredSession::V2(block) => {
                     let (index_entry, sessions_len) = build_block_index_and_len(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32);
@@ -1130,6 +1190,7 @@ impl Storage {
                     idx_file.write_all(&compressed_index)?;
 
                     count += sessions_len;
+                    on_block();
                 }
             }
         }

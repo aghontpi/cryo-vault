@@ -454,7 +454,21 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
 
     println!("Reindexing...");
     storage.flush_pending()?;
-    let count = match storage.reindex() {
+
+    // Block-count denominator: the existing index may be truncated /
+    // out-of-sync, so `stats` would lie. A header-only scan of the data
+    // file gives the real number cheaply (no decompression).
+    let total_blocks = match storage.count_archive_blocks() {
+        Ok(n) => n,
+        // No data yet — fall through to reindex, which will short-circuit.
+        Err(_) => 0,
+    };
+    let pb = make_progress_bar(total_blocks);
+
+    let result = storage.reindex_with_progress(|| {
+        pb.inc(1);
+    });
+    let count = match result {
         Ok(c) => c,
         Err(e)
             if e.downcast_ref::<cryo_vault::storage::StorageError>()
@@ -464,8 +478,12 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
         {
             0
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            pb.abandon();
+            return Err(e);
+        }
     };
+    pb.finish_and_clear();
     println!("✓ Reindexed {} sessions", count);
     Ok(())
 }
