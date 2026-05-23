@@ -278,8 +278,41 @@ Over time, appending loose sessions or streaming logs via the WAL can result in 
 ### B. Specific Workflows (Skills)
 Check the **[`Skills/`](Skills/)** directory! It contains guides and scripts for specific tasks, such as:
 - [**Store Conversations**](Skills/store-conversations/SKILL.md): detailed guide on importing logs, searching history, and using the CLI effectively.
+- [**Auto-Capture**](Skills/auto-capture/SKILL.md): canonical instruction snippet that tells any AI agent to archive every finished conversation to Cryo Vault — see the next section for how to install it.
 
-### C. MCP Server Usage (For AI)
+### C. Auto-Capture across AI agents
+
+Tell Claude Code, GitHub Copilot, Antigravity (and any other agent that reads the cross-tool `AGENTS.md` convention) to **automatically archive every finished conversation** to Cryo Vault. The agent itself does the write — preferring the `add_log` MCP tool when connected, falling back to `cryo add` otherwise — so no extra background process is needed.
+
+A one-shot installer drops the instruction snippet (between `<!-- cryo-vault:auto-capture start/end -->` markers, so re-runs replace in place) into the right rule-file for each client:
+
+| Client | Rule file the installer writes to |
+| :--- | :--- |
+| Claude Code (global) | `~/.claude/CLAUDE.md` |
+| Antigravity + cross-tool agents (global) | `~/.gemini/AGENTS.md` |
+| VSCode Copilot (project) | `./.github/copilot-instructions.md` |
+
+```bash
+# macOS / Linux
+./install-agent-rules.sh
+
+# Windows (PowerShell)
+./install-agent-rules.ps1
+```
+
+Useful flags (both scripts):
+
+| Flag (bash / pwsh) | Purpose |
+| :--- | :--- |
+| `--uninstall` / `-Uninstall` | Strip the snippet from every target. |
+| `--dry-run` / `-DryRun` | Print what would change without modifying files. |
+| `--skip-claude` / `-SkipClaude` | Leave Claude Code's CLAUDE.md alone. |
+| `--skip-agents` / `-SkipAgents` | Leave Antigravity / AGENTS.md alone. |
+| `--skip-copilot` / `-SkipCopilot` | Leave Copilot's instructions file alone. |
+
+Pair this with the MCP server (next section) for the best experience: agents see `add_log` in their tool list, follow its built-in schema and title rules, and your archive fills itself.
+
+### D. MCP Server Usage (For AI)
 The `cryo-vault-mcp` binary is designed to be run by AI clients like Claude Desktop, Cursor, or Antigravity. It speaks the [Model Context Protocol](https://modelcontextprotocol.io/).
 
 
