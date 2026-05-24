@@ -284,6 +284,80 @@ function Prune-OldVersions {
 }
 
 # ---------------------------------------------------------------------------
+# Write MCP config snippets the user can paste into their AI client
+# ---------------------------------------------------------------------------
+#
+# We deliberately do NOT auto-edit each AI client's MCP config — paths and
+# formats vary (Claude Code: ~\.claude.json, Cursor: ~\.cursor\mcp.json,
+# VSCode: user mcp.json with `servers` key not `mcpServers`, Antigravity:
+# IDE-managed). A single overwrite of these snippet files under $Prefix is
+# idempotent by construction: re-running the installer just rewrites them
+# in place, never duplicates.
+
+function Write-McpSnippets {
+    $cryoMcpBin   = Join-Path $BinDir "cryo-vault-mcp.exe"
+    $defaultDb    = Join-Path $env:USERPROFILE ".cryo"
+    $mcpSnippet   = Join-Path $Prefix "mcp-config.snippet.json"
+    $vscodeSnippet = Join-Path $Prefix "mcp-config.vscode.snippet.json"
+
+    Write-Info "Writing MCP config snippets"
+
+    # Escape backslashes for valid JSON string literals on Windows paths.
+    $cryoMcpBinJson = $cryoMcpBin -replace '\\','\\'
+    $defaultDbJson  = $defaultDb  -replace '\\','\\'
+
+    # mcpServers schema — Claude Code, Cursor, Antigravity, Claude Desktop.
+    $mcpServersJson = @"
+{
+  "mcpServers": {
+    "cryo-vault": {
+      "command": "$cryoMcpBinJson",
+      "args": [],
+      "env": {
+        "CRYO_DB_PATH": "$defaultDbJson"
+      }
+    }
+  }
+}
+"@
+    Set-Content -LiteralPath $mcpSnippet -Value $mcpServersJson -Encoding UTF8
+    Write-Ok "Wrote $mcpSnippet"
+
+    # VSCode native MCP uses top-level "servers", not "mcpServers".
+    $vscodeJson = @"
+{
+  "servers": {
+    "cryo-vault": {
+      "command": "$cryoMcpBinJson",
+      "args": [],
+      "env": {
+        "CRYO_DB_PATH": "$defaultDbJson"
+      }
+    }
+  }
+}
+"@
+    Set-Content -LiteralPath $vscodeSnippet -Value $vscodeJson -Encoding UTF8
+    Write-Ok "Wrote $vscodeSnippet"
+}
+
+function Show-McpPasteGuide {
+    $mcpSnippet    = Join-Path $Prefix "mcp-config.snippet.json"
+    $vscodeSnippet = Join-Path $Prefix "mcp-config.vscode.snippet.json"
+    $cryoMcpBin    = Join-Path $BinDir "cryo-vault-mcp.exe"
+
+    Write-Host ""
+    Write-Host "To wire the MCP server into an AI client, paste the relevant snippet into:" -ForegroundColor White
+    Write-Host "    Claude Code   $env:USERPROFILE\.claude.json    (or: claude mcp add cryo-vault `"$cryoMcpBin`" --scope user)"
+    Write-Host "    Cursor        $env:USERPROFILE\.cursor\mcp.json"
+    Write-Host "    Antigravity   IDE -> Manage MCP Servers -> View raw config"
+    Write-Host "    VSCode        Cmd-Shift-P -> MCP: Open User Configuration  (use the vscode snippet — key is `"servers`", not `"mcpServers`")"
+    Write-Host ""
+    Write-Host "    Snippet:        $mcpSnippet" -ForegroundColor Green
+    Write-Host "    VSCode snippet: $vscodeSnippet" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
 # Main install
 # ---------------------------------------------------------------------------
 
@@ -321,6 +395,7 @@ function Invoke-Install {
     Stage-Binaries -SourceInfo $SourceInfo -Platform $Platform
     Activate-Version
     Prune-OldVersions
+    Write-McpSnippets
 
     if (-not $NoPath) {
         Write-Info "Wiring PATH (user scope)"
@@ -336,6 +411,7 @@ function Invoke-Install {
     if (-not $NoPath) {
         Write-Host "    Open a new terminal so the PATH change is picked up."
     }
+    Show-McpPasteGuide
 }
 
 # ---------------------------------------------------------------------------

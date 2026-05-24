@@ -398,6 +398,74 @@ ${PATH_MARKER_END}"
 }
 
 # ---------------------------------------------------------------------------
+# Write MCP config snippets the user can paste into their AI client
+# ---------------------------------------------------------------------------
+#
+# We deliberately do NOT auto-edit each AI client's MCP config — paths and
+# formats vary (Claude Code: ~/.claude.json, Cursor: ~/.cursor/mcp.json,
+# VSCode: user mcp.json with `servers` key not `mcpServers`, Antigravity:
+# IDE-managed). A single overwrite of these snippet files under $PREFIX is
+# idempotent by construction: re-running the installer just rewrites them
+# in place, never duplicates.
+
+write_mcp_snippets() {
+    local cryo_mcp_bin="${BIN_DIR}/cryo-vault-mcp"
+    local default_db="${HOME}/.cryo"
+
+    local mcp_snippet="${PREFIX}/mcp-config.snippet.json"
+    local vscode_snippet="${PREFIX}/mcp-config.vscode.snippet.json"
+
+    info "Writing MCP config snippets"
+
+    # mcpServers schema — Claude Code, Cursor, Antigravity, Claude Desktop.
+    cat > "$mcp_snippet" <<EOF
+{
+  "mcpServers": {
+    "cryo-vault": {
+      "command": "${cryo_mcp_bin}",
+      "args": [],
+      "env": {
+        "CRYO_DB_PATH": "${default_db}"
+      }
+    }
+  }
+}
+EOF
+    ok "Wrote ${mcp_snippet}"
+
+    # VSCode native MCP uses top-level "servers", not "mcpServers".
+    cat > "$vscode_snippet" <<EOF
+{
+  "servers": {
+    "cryo-vault": {
+      "command": "${cryo_mcp_bin}",
+      "args": [],
+      "env": {
+        "CRYO_DB_PATH": "${default_db}"
+      }
+    }
+  }
+}
+EOF
+    ok "Wrote ${vscode_snippet}"
+}
+
+print_mcp_paste_guide() {
+    local mcp_snippet="${PREFIX}/mcp-config.snippet.json"
+    local vscode_snippet="${PREFIX}/mcp-config.vscode.snippet.json"
+
+    printf '\n%sTo wire the MCP server into an AI client, paste the relevant snippet into:%s\n' "${BOLD}" "${RST}"
+    printf '    %sClaude Code%s   ~/.claude.json                     (or: %sclaude mcp add cryo-vault %s --scope user%s)\n' \
+        "${BOLD}" "${RST}" "${DIM}" "${BIN_DIR}/cryo-vault-mcp" "${RST}"
+    printf '    %sCursor%s        ~/.cursor/mcp.json\n' "${BOLD}" "${RST}"
+    printf '    %sAntigravity%s   IDE → Manage MCP Servers → View raw config\n' "${BOLD}" "${RST}"
+    printf '    %sVSCode%s        Cmd-Shift-P → MCP: Open User Configuration  %s(use the vscode snippet — key is %s"servers"%s, not %s"mcpServers"%s)%s\n' \
+        "${BOLD}" "${RST}" "${DIM}" "${BOLD}" "${DIM}" "${BOLD}" "${DIM}" "${RST}"
+    printf '\n    Snippet:        %s%s%s\n' "${GRN}" "$mcp_snippet" "${RST}"
+    printf '    VSCode snippet: %s%s%s\n' "${GRN}" "$vscode_snippet" "${RST}"
+}
+
+# ---------------------------------------------------------------------------
 # Main install flow
 # ---------------------------------------------------------------------------
 
@@ -433,6 +501,7 @@ install() {
     stage_binaries
     activate_version
     prune_old_versions
+    write_mcp_snippets
 
     if [ "$EDIT_PATH" -eq 1 ]; then
         info "Wiring PATH"
@@ -451,6 +520,7 @@ install() {
     if [ "$EDIT_PATH" -eq 1 ]; then
         printf '    Open a new terminal, or %ssource%s your shell rc, to pick up the PATH change.\n' "${BOLD}" "${RST}"
     fi
+    print_mcp_paste_guide
 }
 
 # ---------------------------------------------------------------------------

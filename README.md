@@ -313,17 +313,33 @@ Useful flags (both scripts):
 Pair this with the MCP server (next section) for the best experience: agents see `add_log` in their tool list, follow its built-in schema and title rules, and your archive fills itself.
 
 ### D. MCP Server Usage (For AI)
-The `cryo-vault-mcp` binary is designed to be run by AI clients like Claude Desktop, Cursor, or Antigravity. It speaks the [Model Context Protocol](https://modelcontextprotocol.io/).
+The `cryo-vault-mcp` binary is designed to be run by AI clients like Claude Code, Cursor, VSCode, Antigravity, or Claude Desktop. It speaks the [Model Context Protocol](https://modelcontextprotocol.io/).
 
+**The installer writes ready-to-paste MCP config snippets** under `~/.cryo-vault/` (Windows: `%USERPROFILE%\.cryo-vault\`) with the resolved binary path already baked in, so you don't have to hand-edit absolute paths. Two snippets are produced (re-running the installer overwrites them in place — never duplicates):
 
-**Configuration (VSCode / Cursor / Antigravity / Claude Desktop):**
-Add this to your MCP settings file:
+| File | Schema | Use for |
+| :--- | :--- | :--- |
+| `~/.cryo-vault/mcp-config.snippet.json` | top-level `mcpServers` | Claude Code, Cursor, Antigravity, Claude Desktop |
+| `~/.cryo-vault/mcp-config.vscode.snippet.json` | top-level `servers` | VSCode native MCP (note: different key) |
+
+Paste the relevant snippet into the right config for each client:
+
+| Client | Where to paste |
+| :--- | :--- |
+| **Claude Code** | `~/.claude.json` under `mcpServers` — or simpler: `claude mcp add cryo-vault ~/.cryo-vault/bin/cryo-vault-mcp --scope user` |
+| **Cursor** | `~/.cursor/mcp.json` |
+| **Antigravity** | IDE → *Manage MCP Servers* → *View raw config* |
+| **VSCode** | Command Palette → *MCP: Open User Configuration* (use the `vscode.snippet.json` — key is `servers`, not `mcpServers`) |
+
+The installer also prints this guide at the end of its run, so you don't need to come back to the README.
+
+If you'd rather wire it by hand, the underlying shape is just:
 
 ```json
 {
   "mcpServers": {
     "cryo-vault": {
-      "command": "/absolute/path/to/cryo-vault/target/release/cryo-vault-mcp",
+      "command": "/absolute/path/to/cryo-vault-mcp",
       "args": [],
       "env": {
         "CRYO_DB_PATH": "/Users/username/.cryo"
