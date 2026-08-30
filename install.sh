@@ -15,7 +15,7 @@
 #
 # Usage:
 #   ./install.sh                       # install latest known version
-#   ./install.sh --version v0.2.0      # pin a specific version
+#   ./install.sh --version v0.3.0      # pin a specific version
 #   ./install.sh --uninstall           # remove any installed copy
 #   ./install.sh --prefix ~/.local     # install under ~/.local/cryo-vault
 #   ./install.sh --no-path             # skip editing shell rc
@@ -27,7 +27,7 @@ set -euo pipefail
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_VERSION="v0.2.0"
+DEFAULT_VERSION="v0.3.0"
 GITHUB_REPO="aghontpi/cryo-vault"
 DEFAULT_PREFIX="${HOME}/.cryo-vault"
 
@@ -36,6 +36,7 @@ PREFIX="${DEFAULT_PREFIX}"
 DO_UNINSTALL=0
 EDIT_PATH=1
 FORCE=0
+ENABLE_CAPTURE=1
 SOURCE_OVERRIDE=""   # empty = auto, "local" or "github" forces
 
 PATH_MARKER_BEGIN="# >>> cryo-vault >>>"
@@ -79,6 +80,7 @@ Options:
   --uninstall          Remove any installed cryo-vault and clean PATH entry.
   --no-path            Don't modify shell rc files (~/.zshrc, ~/.bashrc).
   --force              Reinstall even if the same version is already present.
+  --no-capture         Opt out of the default 23:00 nightly local capture.
   -h, --help           Show this help.
 EOF
 }
@@ -91,6 +93,7 @@ while [ $# -gt 0 ]; do
         --uninstall)  DO_UNINSTALL=1; shift;;
         --no-path)    EDIT_PATH=0; shift;;
         --force)      FORCE=1; shift;;
+        --no-capture) ENABLE_CAPTURE=0; shift;;
         -h|--help)    usage; exit 0;;
         *)            die "Unknown option: $1 (try --help)";;
     esac
@@ -211,6 +214,11 @@ remove_path_block_from() {
 
 uninstall() {
     info "Uninstalling cryo-vault from ${PREFIX}"
+
+    local capture_bin="${BIN_DIR}/cryo-vault"
+    if [ -x "$capture_bin" ]; then
+        "$capture_bin" --db "${HOME}/.cryo" capture uninstall || warn "Could not remove the nightly capture scheduler. Run 'cryo capture uninstall' manually."
+    fi
 
     if [ -d "$PREFIX" ]; then
         rm -rf "$PREFIX"
@@ -450,6 +458,19 @@ EOF
     ok "Wrote ${vscode_snippet}"
 }
 
+configure_capture() {
+    if [ "$ENABLE_CAPTURE" -eq 0 ]; then
+        warn "Nightly capture disabled (--no-capture). Run 'cryo capture install' later to enable it."
+        return 0
+    fi
+    info "Enabling nightly local capture at 23:00"
+    if CRYO_CAPTURE_COMMAND="${BIN_DIR}/cryo-vault" "${BIN_DIR}/cryo-vault" capture install --platform all --time 23:00; then
+        ok "Nightly capture enabled"
+    else
+        warn "Could not install the native scheduler; run 'cryo capture install' manually."
+    fi
+}
+
 print_mcp_paste_guide() {
     local mcp_snippet="${PREFIX}/mcp-config.snippet.json"
     local vscode_snippet="${PREFIX}/mcp-config.vscode.snippet.json"
@@ -484,6 +505,7 @@ install() {
     if [ -n "$prev" ]; then
         if [ "$prev" = "$VERSION" ] && [ "$FORCE" -eq 0 ]; then
             ok "Cryo Vault ${VERSION} is already installed at ${PREFIX}."
+            configure_capture
             warn "Re-run with --force to reinstall, or --uninstall to remove."
             return 0
         fi
@@ -502,6 +524,7 @@ install() {
     activate_version
     prune_old_versions
     write_mcp_snippets
+    configure_capture
 
     if [ "$EDIT_PATH" -eq 1 ]; then
         info "Wiring PATH"

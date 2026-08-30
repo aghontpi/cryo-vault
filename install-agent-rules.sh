@@ -108,6 +108,10 @@ becomes searchable later.
 Always include a `title` of 3–7 words that summarises the session.
 Never send placeholders like "Untitled", "Chat", "New chat", or "".
 
+If the platform exposes a lifecycle hook and nightly capture is enabled, keep
+the hook non-blocking by queueing `cryo capture hint --platform <platform>`;
+the scheduled collector performs transcript parsing and database writes.
+
 See the full guidance in `Skills/auto-capture/SKILL.md` of the
 cryo-vault repo.
 EOF

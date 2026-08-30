@@ -15,7 +15,7 @@
     previous PATH entry) before laying down the new one.
 
 .PARAMETER Version
-    Version to install (default: v0.2.0). Accepts "v0.2.0" or "0.2.0".
+    Version to install (default: v0.3.0). Accepts "v0.3.0" or "0.3.0".
 
 .PARAMETER Prefix
     Install prefix. Binaries go to <Prefix>\bin. Default: $env:USERPROFILE\.cryo-vault
@@ -32,23 +32,27 @@
 .PARAMETER Force
     Reinstall even if the same version is already present.
 
+.PARAMETER NoCapture
+    Opt out of the default 23:00 nightly local capture.
+
 .EXAMPLE
     .\install.ps1
 .EXAMPLE
-    .\install.ps1 -Version v0.2.0 -Force
+    .\install.ps1 -Version v0.3.0 -Force
 .EXAMPLE
     .\install.ps1 -Uninstall
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Version = "v0.2.0",
+    [string]$Version = "v0.3.0",
     [string]$Prefix  = (Join-Path $env:USERPROFILE ".cryo-vault"),
     [ValidateSet("local","github","auto")]
     [string]$Source  = "auto",
     [switch]$Uninstall,
     [switch]$NoPath,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$NoCapture
 )
 
 $ErrorActionPreference = "Stop"
@@ -182,6 +186,10 @@ function Remove-BinDirFromUserPath {
 
 function Invoke-Uninstall {
     Write-Info "Uninstalling cryo-vault from $Prefix"
+    $captureBin = Join-Path $BinDir "cryo-vault.exe"
+    if (Test-Path $captureBin) {
+        try { & $captureBin --db (Join-Path $env:USERPROFILE ".cryo") capture uninstall } catch { Write-Warn "Could not remove the nightly capture scheduler. Run 'cryo capture uninstall' manually." }
+    }
     if (Test-Path $Prefix) {
         Remove-Item -Recurse -Force $Prefix
         Write-Ok "Removed $Prefix"
@@ -341,6 +349,29 @@ function Write-McpSnippets {
     Write-Ok "Wrote $vscodeSnippet"
 }
 
+function Configure-Capture {
+    if ($NoCapture) {
+        Write-Warn "Nightly capture disabled (-NoCapture). Run 'cryo capture install' later to enable it."
+        return
+    }
+    Write-Info "Enabling nightly local capture at 23:00"
+    $captureCommand = $env:CRYO_CAPTURE_COMMAND
+    try {
+        $env:CRYO_CAPTURE_COMMAND = Join-Path $BinDir "cryo-vault.exe"
+        & (Join-Path $BinDir "cryo-vault.exe") capture install --platform all --time 23:00
+        if ($LASTEXITCODE -eq 0) { Write-Ok "Nightly capture enabled" }
+        else { Write-Warn "Could not install the native scheduler; run 'cryo capture install' manually." }
+    } catch {
+        Write-Warn "Could not install the native scheduler; run 'cryo capture install' manually."
+    } finally {
+        if ($null -eq $captureCommand) {
+            Remove-Item Env:CRYO_CAPTURE_COMMAND -ErrorAction SilentlyContinue
+        } else {
+            $env:CRYO_CAPTURE_COMMAND = $captureCommand
+        }
+    }
+}
+
 function Show-McpPasteGuide {
     $mcpSnippet    = Join-Path $Prefix "mcp-config.snippet.json"
     $vscodeSnippet = Join-Path $Prefix "mcp-config.vscode.snippet.json"
@@ -379,6 +410,7 @@ function Invoke-Install {
     if ($prev) {
         if (($prev -eq $Version) -and (-not $Force)) {
             Write-Ok "Cryo Vault $Version is already installed at $Prefix."
+            Configure-Capture
             Write-Warn "Re-run with -Force to reinstall, or -Uninstall to remove."
             return
         }
@@ -396,6 +428,7 @@ function Invoke-Install {
     Activate-Version
     Prune-OldVersions
     Write-McpSnippets
+    Configure-Capture
 
     if (-not $NoPath) {
         Write-Info "Wiring PATH (user scope)"
