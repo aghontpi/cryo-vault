@@ -71,32 +71,33 @@ impl SessionWriter {
         let written_bytes = 4 + compressed_bytes.len() as u64;
         self.current_size += written_bytes;
 
-        let build_block_index = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
-            let mut full_text = String::new();
-            let mut message_count = 0;
-            let mut session_ids = Vec::new();
+        let build_block_index =
+            |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
+                let mut full_text = String::new();
+                let mut message_count = 0;
+                let mut session_ids = Vec::new();
 
-            for session in sessions {
-                session_ids.push(session.id.clone());
-                full_text.push_str(&session.extract_full_text());
-                message_count += session.messages.len() as u32;
-            }
+                for session in sessions {
+                    session_ids.push(session.id.clone());
+                    full_text.push_str(&session.extract_full_text());
+                    message_count += session.messages.len() as u32;
+                }
 
-            let (min_time, max_time) = crate::storage::compute_block_time_range(sessions);
+                let (min_time, max_time) = crate::storage::compute_block_time_range(sessions);
 
-            crate::index::BlockIndex::new(
-                session_ids.join(","),
-                crate::index::BlockIndexParams {
-                    content: &full_text,
-                    min_time,
-                    max_time,
-                    data_offset: offset,
-                    compressed_size: comp_size,
-                    uncompressed_size: uncomp_size,
-                    message_count,
-                },
-            )
-        };
+                crate::index::BlockIndex::new(
+                    session_ids.join(","),
+                    crate::index::BlockIndexParams {
+                        content: &full_text,
+                        min_time,
+                        max_time,
+                        data_offset: offset,
+                        compressed_size: comp_size,
+                        uncompressed_size: uncomp_size,
+                        message_count,
+                    },
+                )
+            };
 
         let index_entry = match &wrapper {
             StoredSession::V1(session) => {
@@ -118,12 +119,18 @@ impl SessionWriter {
                     },
                 )
             }
-            StoredSession::Block(sessions) => {
-                build_block_index(sessions, data_offset, compressed_size, raw_bytes.len() as u32)
-            }
-            StoredSession::V2(block) => {
-                build_block_index(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32)
-            }
+            StoredSession::Block(sessions) => build_block_index(
+                sessions,
+                data_offset,
+                compressed_size,
+                raw_bytes.len() as u32,
+            ),
+            StoredSession::V2(block) => build_block_index(
+                &block.sessions,
+                data_offset,
+                compressed_size,
+                raw_bytes.len() as u32,
+            ),
         };
 
         let index_bytes = bincode::serialize(&index_entry)?;

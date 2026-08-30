@@ -70,6 +70,41 @@ fn test_append_and_read_session() {
 }
 
 #[test]
+fn test_latest_revision_wins_across_read_paths() {
+    let (storage, _temp) = create_test_storage();
+    let mut first = create_dummy_session("resumed", 1);
+    first.messages[0].content = "old visible content".to_string();
+    let mut latest = create_dummy_session("resumed", 1);
+    latest.messages[0].content = "new visible content".to_string();
+
+    storage.append_session(first).unwrap();
+    storage.append_session(latest.clone()).unwrap();
+
+    assert_eq!(
+        storage
+            .get_session_by_id("resumed")
+            .unwrap()
+            .unwrap()
+            .messages[0]
+            .content,
+        "new visible content"
+    );
+    assert_eq!(storage.scan_all().unwrap().len(), 1);
+    assert_eq!(
+        storage.search("new visible", None, None).unwrap()[0].messages[0].content,
+        "new visible content"
+    );
+    assert!(
+        storage
+            .search("old visible", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(storage.get_stats().unwrap().session_count, 1);
+    assert_eq!(storage.reindex().unwrap(), 1);
+}
+
+#[test]
 fn test_search() {
     let (storage, _temp) = create_test_storage();
     let s1 = create_dummy_session("s1", 1); // Content: "Message 0 for session s1"
@@ -236,6 +271,43 @@ fn test_idempotency() {
     // Flush pending - should see it's already there and skip
     let archived = storage.flush_pending().unwrap();
     assert_eq!(archived, 0); // 0 because it skipped
+}
+
+#[test]
+fn test_pending_new_revision_replaces_archived_revision() {
+    let (storage, _temp) = create_test_storage();
+    storage
+        .append_session(create_dummy_session("resumed", 1))
+        .unwrap();
+
+    let mut wal = storage.get_wal_writer().unwrap();
+    wal.append(StreamEvent::SessionStart {
+        session_id: "resumed".to_string(),
+        metadata: std::collections::HashMap::new(),
+    })
+    .unwrap();
+    wal.append(StreamEvent::AppendMessage {
+        session_id: "resumed".to_string(),
+        message: MessageInput {
+            role: MessageRole::Model,
+            content: "new revision".to_string(),
+            tool_calls: None,
+            tool_outputs: None,
+            parent_id: None,
+            id: None,
+            metadata: std::collections::HashMap::new(),
+        },
+    })
+    .unwrap();
+    wal.append(StreamEvent::Finalize {
+        session_id: "resumed".to_string(),
+    })
+    .unwrap();
+    wal.flush().unwrap();
+
+    assert_eq!(storage.flush_pending().unwrap(), 1);
+    let latest = storage.get_session_by_id("resumed").unwrap().unwrap();
+    assert_eq!(latest.messages[0].content, "new revision");
 }
 
 #[test]
@@ -634,8 +706,7 @@ fn test_search_recovers_when_index_is_truncated() {
     let mut off = 0usize;
     let mut kept_bytes = 0usize;
     for _ in 0..2 {
-        let sz =
-            u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
         off += 4 + sz;
         kept_bytes = off;
     }

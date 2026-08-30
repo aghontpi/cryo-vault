@@ -62,16 +62,6 @@ pub(crate) fn compute_block_time_range(sessions: &[ChatSessionV1]) -> (u64, u64)
     }
 }
 
-/// Number of session IDs encoded in a BlockIndex.session_id field.
-/// Block indexes join IDs with ",", a single-session V1 entry has no separator.
-pub(crate) fn count_sessions_in_index_id(joined: &str) -> u64 {
-    if joined.is_empty() {
-        0
-    } else {
-        joined.split(',').count() as u64
-    }
-}
-
 fn write_sessions_block(
     data_writer: &mut BufWriter<File>,
     index_writer: &mut BufWriter<File>,
@@ -459,13 +449,20 @@ impl Storage {
         for id in &finalized_ids {
             // Only process if it was built from parts (exists in map)
             if let Some(input) = session_map.remove(id) {
-                // IDEMPOTENCY CHECK: Skip if already exists in the archive
-                if self.get_archived_session_by_id(id)?.is_some() {
+                let session_v1: ChatSessionV1 = input.into();
+                // Skip an exact replay, but preserve a newer pending revision
+                // under the same stable session ID.
+                if self
+                    .get_archived_session_by_id(id)?
+                    .is_some_and(|existing| {
+                        session_v1.messages.is_empty()
+                            || sessions_equivalent(&existing, &session_v1)
+                    })
+                {
                     debug!(session_id = %id, "Session already archived, skipping");
                     continue;
                 }
 
-                let session_v1: ChatSessionV1 = input.into();
                 sessions_to_block.push(session_v1);
                 archived_count += 1;
             }
@@ -620,25 +617,23 @@ impl Storage {
         trace!(query, ?after, ?before, "Starting search");
 
         let mut results = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut pending_ids = std::collections::HashSet::new();
         let query_lower = query.to_lowercase();
 
         // 1. Search Pending Buffer First
         if let Ok(pending_sessions) = self.get_pending_sessions() {
             for s in pending_sessions {
-                if let Some(after_ts) = after {
-                    if let Some(ct) = s.created_at {
-                        if ct < after_ts {
-                            continue;
-                        }
-                    }
+                if let Some(after_ts) = after
+                    && let Some(ct) = s.created_at
+                    && ct < after_ts
+                {
+                    continue;
                 }
-                if let Some(before_ts) = before {
-                    if let Some(ct) = s.created_at {
-                        if ct > before_ts {
-                            continue;
-                        }
-                    }
+                if let Some(before_ts) = before
+                    && let Some(ct) = s.created_at
+                    && ct > before_ts
+                {
+                    continue;
                 }
 
                 let mut found = false;
@@ -649,7 +644,7 @@ impl Storage {
                     }
                 }
                 if found {
-                    seen_ids.insert(s.id.clone());
+                    pending_ids.insert(s.id.clone());
                     results.push(s);
                 }
             }
@@ -680,10 +675,7 @@ impl Storage {
             let mut magic_buf = [0u8; 8];
             file.read_exact(&mut magic_buf)?;
             if magic_buf != DATA_MAGIC {
-                return Err(anyhow::anyhow!(
-                    "Invalid file format in {}",
-                    path.display()
-                ));
+                return Err(anyhow::anyhow!("Invalid file format in {}", path.display()));
             }
 
             // Walk the data file sequentially. When an index entry is
@@ -778,19 +770,17 @@ impl Storage {
                     // sessions outside the requested range slip through when a
                     // block straddles the boundary or contains sessions with
                     // no `created_at`.
-                    if let Some(after_ts) = after {
-                        if let Some(ct) = s.created_at {
-                            if ct < after_ts {
-                                continue;
-                            }
-                        }
+                    if let Some(after_ts) = after
+                        && let Some(ct) = s.created_at
+                        && ct < after_ts
+                    {
+                        continue;
                     }
-                    if let Some(before_ts) = before {
-                        if let Some(ct) = s.created_at {
-                            if ct > before_ts {
-                                continue;
-                            }
-                        }
+                    if let Some(before_ts) = before
+                        && let Some(ct) = s.created_at
+                        && ct > before_ts
+                    {
+                        continue;
                     }
 
                     let mut found = false;
@@ -800,9 +790,16 @@ impl Storage {
                             break;
                         }
                     }
-                    if found && !seen_ids.contains(&s.id) {
-                        seen_ids.insert(s.id.clone());
-                        results.push(s);
+                    if found && !pending_ids.contains(&s.id) {
+                        if let Some(existing) =
+                            results.iter_mut().find(|existing| existing.id == s.id)
+                        {
+                            // A resumed session is appended as a new revision;
+                            // the newest visible content wins.
+                            *existing = s;
+                        } else {
+                            results.push(s);
+                        }
                     }
                 }
             }
@@ -817,8 +814,26 @@ impl Storage {
             }
         }
 
-        debug!(results_count = results.len(), "Search completed");
-        Ok(results)
+        // Search indexes are append-only, so a resumed session may leave an
+        // older revision whose Bloom filter still matches the query. Rebuild
+        // the logical result set from `scan_all`, which resolves revisions in
+        // insertion order and guarantees latest-write-wins semantics.
+        let visible = self.scan_all()?;
+        let visible_matches = visible
+            .into_iter()
+            .filter(|session| {
+                after.is_none_or(|ts| session.created_at.is_none_or(|created| created >= ts))
+                    && before
+                        .is_none_or(|ts| session.created_at.is_none_or(|created| created <= ts))
+                    && session
+                        .messages
+                        .iter()
+                        .any(|message| message.content.to_lowercase().contains(&query_lower))
+            })
+            .collect::<Vec<_>>();
+
+        debug!(results_count = visible_matches.len(), "Search completed");
+        Ok(visible_matches)
     }
 
     /// Reads all sessions from every segment on disk (oldest → newest)
@@ -828,7 +843,7 @@ impl Storage {
     /// take "last N" still see the freshest activity.
     pub fn scan_all(&self) -> Result<Vec<ChatSessionV1>> {
         let mut sessions = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut positions = std::collections::HashMap::new();
 
         // Archive first (chronological), pending appended last so the freshest
         // entries land at the end of the vector — preserving the long-standing
@@ -873,8 +888,10 @@ impl Storage {
                     StoredSession::V2(block) => block.sessions,
                 };
                 for s in block_sessions {
-                    if !seen_ids.contains(&s.id) {
-                        seen_ids.insert(s.id.clone());
+                    if let Some(position) = positions.get(&s.id).copied() {
+                        sessions[position] = s;
+                    } else {
+                        positions.insert(s.id.clone(), sessions.len());
                         sessions.push(s);
                     }
                 }
@@ -883,8 +900,10 @@ impl Storage {
 
         if let Ok(pending) = self.get_pending_sessions() {
             for s in pending {
-                if !seen_ids.contains(&s.id) {
-                    seen_ids.insert(s.id.clone());
+                if let Some(position) = positions.get(&s.id).copied() {
+                    sessions[position] = s;
+                } else {
+                    positions.insert(s.id.clone(), sessions.len());
                     sessions.push(s);
                 }
             }
@@ -896,10 +915,10 @@ impl Storage {
     /// Get a single session by ID using the index (O(1) lookup)
     pub fn get_session_by_id(&self, session_id: &str) -> Result<Option<ChatSessionV1>> {
         // 1. Check pending first
-        if let Ok(pending) = self.get_pending_sessions() {
-            if let Some(s) = pending.into_iter().find(|s| s.id == session_id) {
-                return Ok(Some(s));
-            }
+        if let Ok(pending) = self.get_pending_sessions()
+            && let Some(s) = pending.into_iter().rev().find(|s| s.id == session_id)
+        {
+            return Ok(Some(s));
         }
 
         // 2. Check Archive
@@ -909,6 +928,7 @@ impl Storage {
     /// Internal helper that checks only the persistent archive files, skipping pending.bin.
     /// Iterates every segment so sessions written before rotation remain reachable.
     fn get_archived_session_by_id(&self, session_id: &str) -> Result<Option<ChatSessionV1>> {
+        let mut latest = None;
         for (path, index_path, _seg) in self.list_segments() {
             if !path.exists() {
                 continue;
@@ -954,35 +974,37 @@ impl Storage {
                     let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
                     let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
-                    return match wrapper {
+                    match wrapper {
                         StoredSession::V1(s) => {
                             if s.id == session_id {
-                                Ok(Some(s))
+                                latest = Some(s);
                             } else {
                                 // Bloom false positive on a single-session block — keep scanning.
                                 continue;
                             }
                         }
                         StoredSession::Block(sessions) => {
-                            if let Some(s) = sessions.into_iter().find(|s| s.id == session_id) {
-                                Ok(Some(s))
+                            if let Some(s) = sessions.into_iter().rfind(|s| s.id == session_id) {
+                                latest = Some(s);
                             } else {
                                 continue;
                             }
                         }
                         StoredSession::V2(block) => {
-                            if let Some(s) = block.sessions.into_iter().find(|s| s.id == session_id) {
-                                Ok(Some(s))
+                            if let Some(s) =
+                                block.sessions.into_iter().rfind(|s| s.id == session_id)
+                            {
+                                latest = Some(s);
                             } else {
                                 continue;
                             }
                         }
-                    };
+                    }
                 } // end `if index matches`
             } // end inner loop over index entries
         } // end for over segments
 
-        Ok(None)
+        Ok(latest)
     }
 
     /// Rebuild index from existing data file - Streaming & Atomic
@@ -1021,8 +1043,14 @@ impl Storage {
             total_count += self.reindex_segment(&path, &index_path, &mut on_block)?;
         }
 
-        debug!(sessions_indexed = total_count, "Reindex completed");
-        Ok(total_count)
+        // The archive can contain historical revisions of a resumed session.
+        // Reindexing counts the visible archive, not each superseded record.
+        let visible_count = self
+            .scan_all()
+            .map(|sessions| sessions.len())
+            .unwrap_or(total_count);
+        debug!(sessions_indexed = visible_count, "Reindex completed");
+        Ok(visible_count)
     }
 
     /// Total number of compressed blocks across every archive segment.
@@ -1041,10 +1069,7 @@ impl Storage {
             let mut magic = [0u8; 8];
             file.read_exact(&mut magic)?;
             if magic != DATA_MAGIC {
-                return Err(anyhow::anyhow!(
-                    "Invalid file format in {}",
-                    path.display()
-                ));
+                return Err(anyhow::anyhow!("Invalid file format in {}", path.display()));
             }
             loop {
                 let mut size_buf = [0u8; 4];
@@ -1086,10 +1111,7 @@ impl Storage {
         let mut magic_buf = [0u8; 8];
         file.read_exact(&mut magic_buf)?;
         if magic_buf != DATA_MAGIC {
-            return Err(anyhow::anyhow!(
-                "Invalid file format in {}",
-                path.display()
-            ));
+            return Err(anyhow::anyhow!("Invalid file format in {}", path.display()));
         }
 
         let mut count = 0;
@@ -1113,33 +1135,34 @@ impl Storage {
             let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
             let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
 
-            let build_block_index_and_len = |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
-                let mut full_text = String::new();
-                let mut message_count = 0;
-                let mut session_ids = Vec::new();
+            let build_block_index_and_len =
+                |sessions: &[ChatSessionV1], offset: u64, comp_size: u32, uncomp_size: u32| {
+                    let mut full_text = String::new();
+                    let mut message_count = 0;
+                    let mut session_ids = Vec::new();
 
-                for session in sessions {
-                    session_ids.push(session.id.clone());
-                    full_text.push_str(&session.extract_full_text());
-                    message_count += session.messages.len() as u32;
-                }
+                    for session in sessions {
+                        session_ids.push(session.id.clone());
+                        full_text.push_str(&session.extract_full_text());
+                        message_count += session.messages.len() as u32;
+                    }
 
-                let (min_time, max_time) = compute_block_time_range(sessions);
+                    let (min_time, max_time) = compute_block_time_range(sessions);
 
-                let entry = crate::index::BlockIndex::new(
-                    session_ids.join(","),
-                    crate::index::BlockIndexParams {
-                        content: &full_text,
-                        min_time,
-                        max_time,
-                        data_offset: offset,
-                        compressed_size: comp_size,
-                        uncompressed_size: uncomp_size,
-                        message_count,
-                    },
-                );
-                (entry, sessions.len())
-            };
+                    let entry = crate::index::BlockIndex::new(
+                        session_ids.join(","),
+                        crate::index::BlockIndexParams {
+                            content: &full_text,
+                            min_time,
+                            max_time,
+                            data_offset: offset,
+                            compressed_size: comp_size,
+                            uncompressed_size: uncomp_size,
+                            message_count,
+                        },
+                    );
+                    (entry, sessions.len())
+                };
 
             match wrapper {
                 StoredSession::V1(session) => {
@@ -1171,7 +1194,12 @@ impl Storage {
                     on_block();
                 }
                 StoredSession::Block(sessions) => {
-                    let (index_entry, sessions_len) = build_block_index_and_len(&sessions, data_offset, compressed_size, raw_bytes.len() as u32);
+                    let (index_entry, sessions_len) = build_block_index_and_len(
+                        &sessions,
+                        data_offset,
+                        compressed_size,
+                        raw_bytes.len() as u32,
+                    );
                     let index_bytes = bincode::serialize(&index_entry)?;
                     let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
                     let idx_size = compressed_index.len() as u32;
@@ -1182,7 +1210,12 @@ impl Storage {
                     on_block();
                 }
                 StoredSession::V2(block) => {
-                    let (index_entry, sessions_len) = build_block_index_and_len(&block.sessions, data_offset, compressed_size, raw_bytes.len() as u32);
+                    let (index_entry, sessions_len) = build_block_index_and_len(
+                        &block.sessions,
+                        data_offset,
+                        compressed_size,
+                        raw_bytes.len() as u32,
+                    );
                     let index_bytes = bincode::serialize(&index_entry)?;
                     let compressed_index = zstd::encode_all(&index_bytes[..], 19)?;
                     let idx_size = compressed_index.len() as u32;
@@ -1208,6 +1241,10 @@ impl Storage {
     /// Tries an optimized path using the Index if available.
     /// Fallback to full data scan (slow) if index is missing.
     pub fn get_stats(&self) -> Result<DbStats> {
+        // A capture/resume appends a new revision under the same stable ID.
+        // Derive logical counts from the latest visible sessions, while still
+        // reporting the physical bytes occupied by all archive revisions.
+        let visible_sessions = self.scan_all()?;
         let mut stats = DbStats {
             file_name: self
                 .get_active_file()
@@ -1224,14 +1261,11 @@ impl Storage {
             data_uncompressed_bytes: 0,
         };
 
-        // 1. Count pending stats
-        if let Ok(pending) = self.get_pending_sessions() {
-            for s in pending {
-                stats.accumulate_session(&s);
-            }
+        for session in &visible_sessions {
+            stats.accumulate_session(session);
         }
 
-        // 2. Add pending file size to total disk usage
+        // Add pending file size to total disk usage.
         let pending_path = self.get_pending_file();
         if pending_path.exists() {
             stats.total_size_bytes += fs::metadata(&pending_path)?.len();
@@ -1270,22 +1304,8 @@ impl Storage {
                     let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
                     let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
 
-                    // Each index entry can represent multiple sessions (Block / V2),
-                    // joined by ',' in `session_id`. Counting +=1 here would report
-                    // block count instead of session count.
-                    stats.session_count += count_sessions_in_index_id(&index.session_id);
-                    stats.message_count += index.message_count as u64;
                     stats.data_compressed_bytes += index.compressed_size as u64;
                     stats.data_uncompressed_bytes += index.uncompressed_size as u64;
-
-                    if index.min_time > 0
-                        && (stats.min_time == 0 || index.min_time < stats.min_time)
-                    {
-                        stats.min_time = index.min_time;
-                    }
-                    if index.max_time != u64::MAX && index.max_time > stats.max_time {
-                        stats.max_time = index.max_time;
-                    }
                 }
                 continue; // Move on to the next segment.
             }
@@ -1296,10 +1316,7 @@ impl Storage {
             let mut magic_buf = [0u8; 8];
             file.read_exact(&mut magic_buf)?;
             if magic_buf != DATA_MAGIC {
-                return Err(anyhow::anyhow!(
-                    "Invalid file format in {}",
-                    path.display()
-                ));
+                return Err(anyhow::anyhow!("Invalid file format in {}", path.display()));
             }
 
             loop {
@@ -1322,19 +1339,7 @@ impl Storage {
 
                 let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
                 match wrapper {
-                    StoredSession::V1(s) => {
-                        stats.accumulate_session(&s);
-                    }
-                    StoredSession::Block(block_sessions) => {
-                        for s in &block_sessions {
-                            stats.accumulate_session(s);
-                        }
-                    }
-                    StoredSession::V2(block) => {
-                        for s in &block.sessions {
-                            stats.accumulate_session(s);
-                        }
-                    }
+                    StoredSession::V1(_) | StoredSession::Block(_) | StoredSession::V2(_) => {}
                 }
             }
         }
@@ -1350,7 +1355,11 @@ impl Storage {
     /// Optimise data file into ~target_bytes compressed blocks and rebuild index.
     ///
     /// Calls `on_session` for each session processed.
-    pub fn optimise_with_progress<F>(&self, target_bytes: usize, mut on_session: F) -> Result<(usize, usize)>
+    pub fn optimise_with_progress<F>(
+        &self,
+        target_bytes: usize,
+        mut on_session: F,
+    ) -> Result<(usize, usize)>
     where
         F: FnMut(usize),
     {
@@ -1442,7 +1451,9 @@ impl Storage {
                 let compressed = zstd::encode_all(&raw[..], 19)?;
 
                 if compressed.len() > target_bytes && chunk_sessions.len() > 1 {
-                    let last = chunk_sessions.pop().expect("chunk has at least one session");
+                    let last = chunk_sessions
+                        .pop()
+                        .expect("chunk has at least one session");
                     write_sessions_block(
                         &mut data_writer,
                         &mut index_writer,
@@ -1489,4 +1500,24 @@ impl Storage {
 
         Ok((block_count, session_count))
     }
+}
+
+fn sessions_equivalent(left: &ChatSessionV1, right: &ChatSessionV1) -> bool {
+    left.id == right.id
+        && left.title == right.title
+        && left.source == right.source
+        && left.model == right.model
+        && left.created_at == right.created_at
+        && left.metadata_json == right.metadata_json
+        && left.messages.len() == right.messages.len()
+        && left.messages.iter().zip(&right.messages).all(|(a, b)| {
+            a.role == b.role
+                && a.content == b.content
+                && a.id == b.id
+                && a.parent_id == b.parent_id
+                && a.metadata_json == b.metadata_json
+                && a.tool_calls.as_ref().map(|v| v.len()) == b.tool_calls.as_ref().map(|v| v.len())
+                && a.tool_outputs.as_ref().map(|v| v.len())
+                    == b.tool_outputs.as_ref().map(|v| v.len())
+        })
 }
