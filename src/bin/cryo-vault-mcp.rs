@@ -111,7 +111,7 @@ fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &Path) -> Jso
                 "protocolVersion": "2024-11-05", // Spec version
                 "serverInfo": {
                     "name": "cryo-vault-mcp",
-                    "version": "0.1.0"
+                    "version": "0.3.0"
                 },
                 "capabilities": {
                     "tools": {}
