@@ -1,0 +1,3 @@
+{"conversationId":"cursor-fixture-1","timestamp":1700000003,"model":"cursor-model","role":"user","content":"Check transcript discovery"}
+{"conversationId":"cursor-fixture-1","role":"assistant","content":"Only transcript layouts should be scanned."}
+{"conversationId":"cursor-fixture-1","role":"tool","content":"discovery passed"}

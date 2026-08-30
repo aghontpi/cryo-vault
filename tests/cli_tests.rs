@@ -11,6 +11,84 @@ fn cryo_command(db_path: &Path) -> Command {
     cmd
 }
 
+#[test]
+fn test_cli_capture_run_and_idempotency() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join(".cryo-vault/imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    std::fs::write(
+        import_root.join("session.json"),
+        r#"{"session_id":"capture-one","messages":[{"role":"user","content":"capture me"},{"role":"assistant","content":"done"}]}"#,
+    )
+    .unwrap();
+
+    cryo_command(&db_path)
+        .env("HOME", temp_dir.path())
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unstable 1"));
+
+    cryo_command(&db_path)
+        .env("HOME", temp_dir.path())
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported 1"));
+
+    cryo_command(&db_path)
+        .arg("search")
+        .arg("capture me")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capture-generic-"));
+}
+
+#[test]
+fn test_cli_capture_scheduler_dry_run_and_time_validation() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+
+    cryo_command(&db_path)
+        .args(["capture", "install", "--time", "01:15", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01:15"));
+
+    cryo_command(&db_path)
+        .args(["capture", "install", "--time", "25:00", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("capture time must be HH:MM"));
+}
+
+#[test]
+fn test_cli_capture_hint_queues_only_json_result() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+
+    cryo_command(&db_path)
+        .args(["capture", "hint", "--platform", "antigravity", "--stdin"])
+        .write_stdin(
+            r#"{"conversationId":"conversation-1","transcriptPath":"/tmp/transcript.jsonl"}"#,
+        )
+        .assert()
+        .success()
+        .stdout("{\"queued\":true}\n")
+        .stderr(predicate::str::is_empty());
+
+    assert!(!db_path.join("capture-state.json").exists());
+    assert_eq!(
+        std::fs::read_dir(db_path.join("capture-hints"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
 /// Tests that the `stats` command works correctly on an empty database.
 /// Verifies that the output contains "Database Statistics" and "Total Sessions: 0".
 #[test]

@@ -1,0 +1,2447 @@
+//! Nightly, local transcript discovery and archival.
+//!
+//! The capture pipeline intentionally has a small, conservative parser. Local
+//! clients change their JSON envelopes fairly often, but the useful portion of
+//! those files is remarkably consistent: a role, some content, and a session
+//! identifier. Unknown envelope fields are ignored and hidden reasoning fields
+//! are never copied into the archive.
+
+use anyhow::{Context, Result, anyhow};
+use chrono::DateTime;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+use crate::schema::{ChatGptConversation, ChatSessionV1, MessageRole, MessageV1};
+use crate::storage::Storage;
+
+pub const DEFAULT_CAPTURE_TIME: &str = "23:00";
+const STATE_FILE: &str = "capture-state.json";
+const HOOK_FILE: &str = "capture-hooks.jsonl";
+const HINT_QUEUE_DIR: &str = "capture-hints";
+const DEFAULT_STABLE_AGE_SECS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Platform {
+    All,
+    Codex,
+    ClaudeCode,
+    CopilotCli,
+    Cursor,
+    GeminiCli,
+    Antigravity,
+    Generic,
+}
+
+impl Platform {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude-code",
+            Self::CopilotCli => "copilot-cli",
+            Self::Cursor => "cursor",
+            Self::GeminiCli => "gemini-cli",
+            Self::Antigravity => "antigravity",
+            Self::Generic => "generic",
+        }
+    }
+
+    pub fn sources(self) -> Vec<Self> {
+        if self == Self::All {
+            vec![
+                Self::Codex,
+                Self::ClaudeCode,
+                Self::CopilotCli,
+                Self::Cursor,
+                Self::GeminiCli,
+                Self::Antigravity,
+                Self::Generic,
+            ]
+        } else {
+            vec![self]
+        }
+    }
+}
+
+impl fmt::Display for Platform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.slug())
+    }
+}
+
+impl FromStr for Platform {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('_', "-").as_str() {
+            "all" => Ok(Self::All),
+            "codex" | "openai-codex" => Ok(Self::Codex),
+            "claude" | "claude-code" => Ok(Self::ClaudeCode),
+            "copilot" | "copilot-cli" => Ok(Self::CopilotCli),
+            "cursor" => Ok(Self::Cursor),
+            "gemini" | "gemini-cli" => Ok(Self::GeminiCli),
+            "antigravity" => Ok(Self::Antigravity),
+            "generic" | "json" => Ok(Self::Generic),
+            other => Err(anyhow!("unsupported capture platform: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureOptions {
+    pub platform: Platform,
+    pub dry_run: bool,
+    pub time: String,
+    /// Retained for API compatibility; stability is now based on two
+    /// identical observations (or a concrete lifecycle hint).
+    pub stable_age_secs: u64,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            platform: Platform::All,
+            dry_run: false,
+            time: DEFAULT_CAPTURE_TIME.to_string(),
+            stable_age_secs: DEFAULT_STABLE_AGE_SECS,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct CaptureReport {
+    pub discovered_files: usize,
+    pub stable_files: usize,
+    pub imported_sessions: usize,
+    pub skipped_unchanged: usize,
+    pub skipped_unstable: usize,
+    pub skipped_empty: usize,
+    pub failed_files: usize,
+    pub hook_hints: usize,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CaptureState {
+    pub version: u32,
+    pub files: HashMap<String, FileState>,
+    pub pending_hooks: Vec<HookHint>,
+    pub last_run_at: Option<u64>,
+    #[serde(default)]
+    pub schedule: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileState {
+    pub size: u64,
+    pub modified_at: u64,
+    pub fingerprint: String,
+    pub captured_fingerprint: Option<String>,
+    pub last_seen_at: u64,
+    #[serde(default)]
+    pub stable_observations: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookHint {
+    pub platform: Platform,
+    pub session_id: Option<String>,
+    pub path: Option<String>,
+    pub seen_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    platform: Platform,
+    path: PathBuf,
+}
+
+pub fn parse_schedule_time(value: &str) -> Result<(u8, u8)> {
+    let mut parts = value.split(':');
+    let hour = parts
+        .next()
+        .ok_or_else(|| anyhow!("capture time must be HH:MM"))?
+        .parse::<u8>()?;
+    let minute = parts
+        .next()
+        .ok_or_else(|| anyhow!("capture time must be HH:MM"))?
+        .parse::<u8>()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return Err(anyhow!(
+            "capture time must be HH:MM in the 00:00–23:59 range"
+        ));
+    }
+    Ok((hour, minute))
+}
+
+pub fn run(db_path: &Path, options: &CaptureOptions) -> Result<CaptureReport> {
+    let roots = default_roots(options.platform);
+    run_with_roots(db_path, options, &roots)
+}
+
+/// Testable form of [`run`]. Each tuple is a platform-specific discovery root.
+pub fn run_with_roots(
+    db_path: &Path,
+    options: &CaptureOptions,
+    roots: &[(Platform, PathBuf)],
+) -> Result<CaptureReport> {
+    parse_schedule_time(&options.time)?;
+    // The CLI holds the database lock while this function runs. Hooks never
+    // take that lock: they append one immutable queue record instead.
+    let (mut state, queued_records, legacy_journal_removable) = load_capture_inputs(db_path)?;
+    let now = now_secs();
+    let mut candidates = discover_candidates(roots);
+    let mut known_paths = candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<HashSet<_>>();
+    let hinted_paths = state
+        .pending_hooks
+        .iter()
+        .filter_map(|hint| hint.path.as_ref().map(PathBuf::from))
+        .collect::<HashSet<_>>();
+    for hint in &state.pending_hooks {
+        if let Some(path) = &hint.path {
+            let path = PathBuf::from(path);
+            if path.is_file() && known_paths.insert(path.clone()) {
+                candidates.push(Candidate {
+                    platform: hint.platform,
+                    path,
+                });
+            }
+        }
+    }
+    let mut report = CaptureReport {
+        discovered_files: candidates.len(),
+        dry_run: options.dry_run,
+        hook_hints: state.pending_hooks.len(),
+        ..Default::default()
+    };
+    let storage = Storage::new(db_path.to_path_buf());
+    let mut imports = Vec::new();
+    let mut resolved_hint_paths = HashSet::new();
+    let mut resolved_session_ids = HashSet::new();
+
+    for candidate in candidates {
+        let metadata = match fs::metadata(&candidate.path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let size = metadata.len();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(now);
+        let bytes = match fs::read(&candidate.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(path = %candidate.path.display(), %error, "capture could not read transcript");
+                report.failed_files += 1;
+                continue;
+            }
+        };
+        let fingerprint = fingerprint_bytes(&bytes);
+        let key = candidate.path.to_string_lossy().to_string();
+        let previous = state.files.get(&key);
+        let unchanged_observation = previous.is_some_and(|old| {
+            old.size == size && old.modified_at == modified_at && old.fingerprint == fingerprint
+        });
+        let previously_captured = previous.and_then(|old| old.captured_fingerprint.clone());
+        let already_captured = previously_captured.as_deref() == Some(&fingerprint);
+        let stable_observations = if unchanged_observation {
+            previous
+                .map(|old| old.stable_observations.max(1).saturating_add(1).min(2))
+                .unwrap_or(2)
+        } else {
+            1
+        };
+        let hinted_path = hinted_paths.contains(&candidate.path);
+        let stable = hinted_path || stable_observations >= 2;
+
+        state.files.insert(
+            key.clone(),
+            FileState {
+                size,
+                modified_at,
+                fingerprint: fingerprint.clone(),
+                captured_fingerprint: previously_captured,
+                last_seen_at: now,
+                stable_observations,
+            },
+        );
+
+        if !stable {
+            report.skipped_unstable += 1;
+            continue;
+        }
+        report.stable_files += 1;
+
+        if already_captured {
+            report.skipped_unchanged += 1;
+            continue;
+        }
+
+        let sessions = match parse_transcript(candidate.platform, &candidate.path, &bytes) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(path = %candidate.path.display(), %error, "capture skipped malformed transcript");
+                report.failed_files += 1;
+                continue;
+            }
+        };
+        if sessions.is_empty() {
+            report.skipped_empty += 1;
+            continue;
+        }
+        if hinted_path {
+            resolved_hint_paths.insert(candidate.path.clone());
+        }
+
+        for mut session in sessions {
+            if let Some(source_id) = metadata_value(&session, "platform_session_id") {
+                resolved_session_ids.insert(source_id);
+            }
+            let existing = storage.get_session_by_id(&session.id)?;
+            let is_unchanged = existing
+                .as_ref()
+                .and_then(|existing| metadata_value(existing, "content_fingerprint"))
+                .is_some_and(|old| old == fingerprint_for_session(&session));
+            if is_unchanged {
+                report.skipped_unchanged += 1;
+            } else {
+                if let Some(existing) = existing.as_ref() {
+                    set_capture_revision(
+                        &mut session,
+                        metadata_u64(existing, "capture_revision").unwrap_or(1) + 1,
+                    );
+                }
+                imports.push(session);
+            }
+        }
+        if let Some(file_state) = state.files.get_mut(&key) {
+            file_state.captured_fingerprint = Some(fingerprint);
+        }
+    }
+
+    if !options.dry_run && !imports.is_empty() {
+        report.imported_sessions = storage.append_bulk(imports)?;
+    } else if options.dry_run {
+        report.imported_sessions = report.stable_files.saturating_sub(report.skipped_unchanged);
+    }
+
+    state.last_run_at = Some(now);
+    if !options.dry_run {
+        state.pending_hooks.retain(|hint| {
+            if let Some(path) = &hint.path {
+                return !resolved_hint_paths.contains(&PathBuf::from(path));
+            }
+            hint.session_id
+                .as_ref()
+                .is_none_or(|session_id| !resolved_session_ids.contains(session_id))
+        });
+        save_state(db_path, &state)?;
+        remove_capture_inputs(db_path, &queued_records, legacy_journal_removable)?;
+    }
+    Ok(report)
+}
+
+pub fn record_hook_hint(db_path: &Path, hint: HookHint) -> Result<()> {
+    let queue = db_path.join(HINT_QUEUE_DIR);
+    fs::create_dir_all(&queue)?;
+    let path = queue.join(format!("hint-{}.json", Uuid::new_v4().simple()));
+    // create_new makes every hook event an independent record and avoids
+    // append races between multiple lifecycle hooks.
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    serde_json::to_writer(&mut file, &hint)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn load_state(db_path: &Path) -> Result<CaptureState> {
+    Ok(load_capture_inputs(db_path)?.0)
+}
+
+fn load_capture_inputs(db_path: &Path) -> Result<(CaptureState, Vec<PathBuf>, bool)> {
+    let path = db_path.join(STATE_FILE);
+    let mut state = if !path.exists() {
+        CaptureState {
+            version: 1,
+            ..Default::default()
+        }
+    } else {
+        let bytes = fs::read(path).context("failed to read capture state")?;
+        serde_json::from_slice(&bytes).context("failed to decode capture state")?
+    };
+
+    let (queued_records, mut queued_hints) = read_hint_queue(db_path)?;
+    let (legacy_journal_present, legacy_hints, legacy_journal_removable) =
+        if db_path.join(HOOK_FILE).exists() {
+            let (hints, removable) = read_legacy_journal(db_path)?;
+            (true, hints, removable)
+        } else {
+            (false, Vec::new(), false)
+        };
+    if legacy_journal_present {
+        queued_hints.extend(legacy_hints);
+    }
+    state.pending_hooks.extend(queued_hints);
+    deduplicate_hints(&mut state.pending_hooks);
+    Ok((state, queued_records, legacy_journal_removable))
+}
+
+fn read_hint_queue(db_path: &Path) -> Result<(Vec<PathBuf>, Vec<HookHint>)> {
+    let queue = db_path.join(HINT_QUEUE_DIR);
+    let mut records = Vec::new();
+    let mut hints = Vec::new();
+    let Ok(entries) = fs::read_dir(queue) else {
+        return Ok((records, hints));
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(hint) = serde_json::from_slice::<HookHint>(&bytes)
+        {
+            records.push(path.clone());
+            hints.push(hint);
+        }
+    }
+    records.sort();
+    Ok((records, hints))
+}
+
+fn read_legacy_journal(db_path: &Path) -> Result<(Vec<HookHint>, bool)> {
+    let path = db_path.join(HOOK_FILE);
+    if !path.exists() {
+        return Ok((Vec::new(), false));
+    }
+    let bytes = fs::read(path)?;
+    let mut hints = Vec::new();
+    let mut removable = true;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        if let Ok(hint) = serde_json::from_slice::<HookHint>(line) {
+            hints.push(hint);
+        } else {
+            removable = false;
+        }
+    }
+    Ok((hints, removable))
+}
+
+fn deduplicate_hints(hints: &mut Vec<HookHint>) {
+    let mut latest = HashMap::new();
+    for hint in hints.drain(..) {
+        let key = (hint.platform, hint.session_id.clone(), hint.path.clone());
+        latest
+            .entry(key)
+            .and_modify(|existing: &mut HookHint| {
+                if hint.seen_at >= existing.seen_at {
+                    *existing = hint.clone();
+                }
+            })
+            .or_insert(hint);
+    }
+    hints.extend(latest.into_values());
+    hints.sort_by_key(|hint| hint.seen_at);
+}
+
+fn remove_capture_inputs(
+    db_path: &Path,
+    records: &[PathBuf],
+    legacy_journal_present: bool,
+) -> Result<()> {
+    for path in records {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    if legacy_journal_present {
+        let path = db_path.join(HOOK_FILE);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    let queue = db_path.join(HINT_QUEUE_DIR);
+    if queue.exists() && fs::read_dir(&queue)?.next().is_none() {
+        fs::remove_dir(queue)?;
+    }
+    Ok(())
+}
+
+fn save_state(db_path: &Path, state: &CaptureState) -> Result<()> {
+    fs::create_dir_all(db_path)?;
+    let path = db_path.join(STATE_FILE);
+    let temp = db_path.join("capture-state.json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(state)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+pub fn clear_schedule(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut state = load_state(db_path)?;
+    state.schedule = None;
+    save_state(db_path, &state)
+}
+
+pub fn parse_transcript(
+    platform: Platform,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Vec<ChatSessionV1>> {
+    let file_fingerprint = fingerprint_bytes(bytes);
+    let value = serde_json::from_slice::<Value>(bytes).ok();
+    let mut sessions = if let Some(value) = value {
+        parse_document(platform, path, &value, &file_fingerprint)?
+    } else {
+        parse_jsonl(platform, path, bytes, &file_fingerprint)
+    };
+    sessions.retain(|s| !s.messages.is_empty());
+    Ok(sessions)
+}
+
+fn parse_document(
+    platform: Platform,
+    path: &Path,
+    value: &Value,
+    file_fingerprint: &str,
+) -> Result<Vec<ChatSessionV1>> {
+    if let Some(items) = value.as_array() {
+        let mut result = Vec::new();
+        for item in items {
+            if item.get("mapping").is_some() {
+                if let Ok(conversation) =
+                    serde_json::from_value::<ChatGptConversation>(item.clone())
+                {
+                    let source_id = conversation.id.clone();
+                    if let Ok(session) = ChatSessionV1::try_from(conversation) {
+                        result.push(with_capture_metadata(
+                            session,
+                            platform,
+                            path,
+                            &source_id,
+                            file_fingerprint,
+                        ));
+                    }
+                }
+            } else if let Some(session) =
+                parse_value_as_session(platform, path, item, file_fingerprint)
+            {
+                result.push(session);
+            }
+        }
+        return Ok(result);
+    }
+    if value.get("mapping").is_some() {
+        let conversation: ChatGptConversation = serde_json::from_value(value.clone())?;
+        let source_id = conversation.id.clone();
+        let session: ChatSessionV1 = conversation.try_into()?;
+        return Ok(vec![with_capture_metadata(
+            session,
+            platform,
+            path,
+            &source_id,
+            file_fingerprint,
+        )]);
+    }
+    Ok(
+        parse_value_as_session(platform, path, value, file_fingerprint)
+            .into_iter()
+            .collect(),
+    )
+}
+
+fn parse_jsonl(
+    platform: Platform,
+    path: &Path,
+    bytes: &[u8],
+    file_fingerprint: &str,
+) -> Vec<ChatSessionV1> {
+    let mut messages = Vec::new();
+    let mut session_id = None;
+    let mut model = None;
+    let mut created_at = None;
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        session_id = session_id.or_else(|| {
+            find_string(
+                &value,
+                &[
+                    "session_id",
+                    "sessionId",
+                    "conversation_id",
+                    "conversationId",
+                ],
+            )
+        });
+        model = model.or_else(|| find_string(&value, &["model", "model_name", "modelName"]));
+        created_at = created_at.or_else(|| find_timestamp(&value));
+        collect_message_records(&value, &mut messages);
+    }
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let id = session_id.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
+    let mut session = make_session(platform, path, &id, model, created_at, messages);
+    session = with_capture_metadata(session, platform, path, &id, file_fingerprint);
+    vec![session]
+}
+
+fn parse_value_as_session(
+    platform: Platform,
+    path: &Path,
+    value: &Value,
+    file_fingerprint: &str,
+) -> Option<ChatSessionV1> {
+    if let Some(messages_value) = value.get("messages").or_else(|| value.get("conversation")) {
+        let mut messages = Vec::new();
+        if let Some(items) = messages_value.as_array() {
+            for item in items {
+                collect_message_records(item, &mut messages);
+            }
+        }
+        if !messages.is_empty() {
+            let id = find_string(
+                value,
+                &[
+                    "session_id",
+                    "sessionId",
+                    "conversation_id",
+                    "conversationId",
+                    "id",
+                ],
+            )
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("session")
+                    .to_string()
+            });
+            let session = make_session(
+                platform,
+                path,
+                &id,
+                find_string(value, &["model", "model_name", "modelName"]),
+                find_timestamp(value),
+                messages,
+            );
+            return Some(with_capture_metadata(
+                session,
+                platform,
+                path,
+                &id,
+                file_fingerprint,
+            ));
+        }
+    }
+    None
+}
+
+fn make_session(
+    platform: Platform,
+    path: &Path,
+    source_id: &str,
+    model: Option<String>,
+    created_at: Option<u64>,
+    messages: Vec<MessageV1>,
+) -> ChatSessionV1 {
+    let title = title_from_messages(&messages, platform);
+    ChatSessionV1 {
+        id: stable_session_id(platform, source_id, path),
+        title: Some(title),
+        source: Some(platform.slug().to_string()),
+        model,
+        created_at,
+        metadata_json: String::new(),
+        messages,
+    }
+}
+
+fn with_capture_metadata(
+    mut session: ChatSessionV1,
+    platform: Platform,
+    path: &Path,
+    source_id: &str,
+    file_fingerprint: &str,
+) -> ChatSessionV1 {
+    let session_fingerprint = fingerprint_for_session(&session);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "source_path".into(),
+        Value::String(path.to_string_lossy().to_string()),
+    );
+    metadata.insert(
+        "platform_session_id".into(),
+        Value::String(source_id.to_string()),
+    );
+    metadata.insert(
+        "content_fingerprint".into(),
+        Value::String(session_fingerprint),
+    );
+    metadata.insert(
+        "file_fingerprint".into(),
+        Value::String(file_fingerprint.to_string()),
+    );
+    metadata.insert("last_seen_at".into(), Value::Number(now_secs().into()));
+    metadata.insert("capture_revision".into(), Value::Number(1.into()));
+    session.metadata_json = Value::Object(metadata).to_string();
+    // Keep the stable source identity independent of a path's spelling.
+    session.id = stable_session_id(platform, source_id, path);
+    session
+}
+
+fn collect_message_records(value: &Value, out: &mut Vec<MessageV1>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(nested) = object.get("message")
+        && nested.is_object()
+    {
+        collect_message_records(nested, out);
+        return;
+    }
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("type").and_then(Value::as_str));
+    let role = role.and_then(normalize_role);
+    if let Some(role) = role {
+        if role == MessageRole::Thought {
+            return;
+        }
+        if is_hidden_record(object) {
+            return;
+        }
+        let content = object
+            .get("content")
+            .or_else(|| object.get("text"))
+            .or_else(|| object.get("parts"))
+            .or_else(|| object.get("result"))
+            .map(extract_visible_text)
+            .unwrap_or_default();
+        if !content.trim().is_empty() {
+            out.push(MessageV1 {
+                role,
+                content: content.trim().to_string(),
+                tool_calls: None,
+                tool_outputs: None,
+                id: find_string(value, &["id", "message_id", "messageId"]),
+                parent_id: find_string(value, &["parent_id", "parentId"]),
+                metadata_json: String::new(),
+            });
+        }
+        return;
+    }
+    for child in object.values() {
+        collect_message_records(child, out);
+    }
+}
+
+fn normalize_role(role: &str) -> Option<MessageRole> {
+    match role.to_ascii_lowercase().as_str() {
+        "user" | "human" | "user.message" | "prompt" => Some(MessageRole::User),
+        "assistant" | "model" | "ai" | "assistant.message" => Some(MessageRole::Model),
+        "system" | "system.message" => Some(MessageRole::System),
+        "tool" | "tool_result" | "tool-use" | "tool_call" | "function" => Some(MessageRole::Tool),
+        "thought" | "thinking" | "reasoning" | "analysis" => Some(MessageRole::Thought),
+        _ => None,
+    }
+}
+
+fn is_hidden_record(object: &Map<String, Value>) -> bool {
+    object.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || object.get("is_internal").and_then(Value::as_bool) == Some(true)
+        || object.get("hidden").and_then(Value::as_bool) == Some(true)
+        || object
+            .get("subtype")
+            .and_then(Value::as_str)
+            .is_some_and(|s| matches!(s, "thinking" | "reasoning" | "internal" | "progress"))
+}
+
+fn extract_visible_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(extract_visible_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str).is_some_and(|t| {
+                matches!(
+                    t,
+                    "thinking" | "reasoning" | "analysis" | "redacted_thinking"
+                )
+            }) {
+                return String::new();
+            }
+            if let Some(text) = object.get("text") {
+                return extract_visible_text(text);
+            }
+            if let Some(content) = object.get("content") {
+                return extract_visible_text(content);
+            }
+            if let Some(parts) = object.get("parts") {
+                return extract_visible_text(parts);
+            }
+            if let Some(name) = object.get("name").and_then(Value::as_str) {
+                let args = object
+                    .get("arguments")
+                    .or_else(|| object.get("input"))
+                    .map(extract_visible_text)
+                    .unwrap_or_default();
+                return if args.is_empty() {
+                    format!("[tool: {name}]")
+                } else {
+                    format!("[tool: {name}] {args}")
+                };
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
+    let object = value.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str).map(str::to_string))
+}
+
+fn find_timestamp(value: &Value) -> Option<u64> {
+    let object = value.as_object()?;
+    for key in [
+        "created_at",
+        "create_time",
+        "timestamp",
+        "createdAt",
+        "date",
+    ] {
+        if let Some(number) = object.get(key).and_then(Value::as_u64) {
+            return Some(if number > 10_000_000_000 {
+                number / 1000
+            } else {
+                number
+            });
+        }
+        if let Some(text) = object.get(key).and_then(Value::as_str) {
+            if let Ok(number) = text.parse::<u64>() {
+                return Some(if number > 10_000_000_000 {
+                    number / 1000
+                } else {
+                    number
+                });
+            }
+            if let Ok(date) = DateTime::parse_from_rfc3339(text) {
+                return Some(date.timestamp().max(0) as u64);
+            }
+        }
+    }
+    None
+}
+
+fn title_from_messages(messages: &[MessageV1], platform: Platform) -> String {
+    let text = messages
+        .iter()
+        .find(|m| m.role == MessageRole::User)
+        .map(|m| m.content.as_str())
+        .unwrap_or("conversation");
+    let words: Vec<&str> = text.split_whitespace().take(6).collect();
+    if words.is_empty() {
+        return format!("{} conversation", platform.slug());
+    }
+    words
+        .join(" ")
+        .trim_end_matches(&['.', '!', '?', ':', ';'][..])
+        .to_string()
+}
+
+fn stable_session_id(platform: Platform, source_id: &str, path: &Path) -> String {
+    let identity = if source_id.is_empty() {
+        path.to_string_lossy().to_string()
+    } else {
+        source_id.to_string()
+    };
+    format!(
+        "capture-{}-{:016x}",
+        platform.slug(),
+        fnv1a(identity.as_bytes())
+    )
+}
+
+pub fn fingerprint_for_session(session: &ChatSessionV1) -> String {
+    let mut bytes = Vec::new();
+    for message in &session.messages {
+        bytes.extend_from_slice(format!("{:?}:{}\n", message.role, message.content).as_bytes());
+    }
+    format!("{:016x}", fnv1a(&bytes))
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    format!("{:016x}", fnv1a(bytes))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn metadata_value(session: &ChatSessionV1, key: &str) -> Option<String> {
+    serde_json::from_str::<Value>(&session.metadata_json)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn metadata_u64(session: &ChatSessionV1, key: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(&session.metadata_json)
+        .ok()?
+        .get(key)?
+        .as_u64()
+}
+
+fn set_capture_revision(session: &mut ChatSessionV1, revision: u64) {
+    let mut metadata = serde_json::from_str::<Value>(&session.metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert("capture_revision".into(), Value::Number(revision.into()));
+    session.metadata_json = Value::Object(metadata).to_string();
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn default_roots(platform: Platform) -> Vec<(Platform, PathBuf)> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for source in platform.sources() {
+        let root = match source {
+            Platform::Codex => home.join(".codex/sessions"),
+            Platform::ClaudeCode => home.join(".claude/projects"),
+            Platform::CopilotCli => home.join(".copilot/session-state"),
+            Platform::Cursor => home.join(".cursor/projects"),
+            Platform::GeminiCli => home.join(".gemini/tmp"),
+            Platform::Antigravity => home.join(".gemini/antigravity-cli"),
+            Platform::Generic => continue,
+            Platform::All => unreachable!(),
+        };
+        roots.push((source, root));
+    }
+    if platform.sources().contains(&Platform::Generic)
+        && let Some(import_roots) = std::env::var_os("CRYO_CAPTURE_IMPORT_ROOTS")
+    {
+        roots.extend(std::env::split_paths(&import_roots).map(|root| (Platform::Generic, root)));
+    }
+    if platform.sources().contains(&Platform::Antigravity) {
+        roots.push((Platform::Antigravity, home.join(".gemini/antigravity-ide")));
+        roots.push((Platform::Antigravity, home.join(".gemini/antigravity")));
+    }
+    roots
+}
+
+fn discover_candidates(roots: &[(Platform, PathBuf)]) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for (platform, root) in roots {
+        collect_files(root, root, &mut candidates, *platform, &mut seen);
+    }
+    candidates
+}
+
+fn collect_files(
+    discovery_root: &Path,
+    root: &Path,
+    out: &mut Vec<Candidate>,
+    platform: Platform,
+    seen: &mut HashSet<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                (name.starts_with('.')
+                    && !(platform == Platform::Antigravity && name == ".system_generated"))
+                    || name == "node_modules"
+            })
+        {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_files(discovery_root, &path, out, platform, seen);
+        } else if file_type.is_file()
+            && allowed_transcript_path(platform, discovery_root, &path)
+            && seen.insert(path.clone())
+        {
+            out.push(Candidate { platform, path });
+        }
+    }
+}
+
+fn allowed_transcript_path(platform: Platform, root: &Path, path: &Path) -> bool {
+    let extension = path.extension().and_then(|e| e.to_str());
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    match platform {
+        Platform::Codex => extension == Some("jsonl") && file_name.starts_with("rollout-"),
+        Platform::ClaudeCode => matches!(extension, Some("jsonl" | "ndjson")),
+        Platform::CopilotCli => {
+            matches!(extension, Some("json" | "jsonl" | "ndjson"))
+                && (components.iter().any(|component| {
+                    matches!(*component, "session-state" | "sessions" | "transcripts")
+                }) || matches!(
+                    root.file_name().and_then(|name| name.to_str()),
+                    Some("session-state" | "sessions")
+                ))
+                && !file_name.eq_ignore_ascii_case("settings.json")
+        }
+        Platform::Cursor => {
+            matches!(extension, Some("json" | "jsonl" | "ndjson"))
+                && components.iter().any(|component| {
+                    matches!(*component, "agent-transcripts" | "transcripts" | "sessions")
+                })
+        }
+        Platform::GeminiCli => {
+            extension == Some("json")
+                && components
+                    .iter()
+                    .any(|component| matches!(*component, "chats" | "sessions" | "tmp"))
+                && !file_name.eq_ignore_ascii_case("settings.json")
+        }
+        Platform::Antigravity => {
+            matches!(extension, Some("jsonl"))
+                && file_name == "transcript.jsonl"
+                && !components.iter().any(|component| {
+                    matches!(
+                        *component,
+                        "history" | "cache" | "settings" | "database" | "databases"
+                    )
+                })
+        }
+        Platform::Generic => matches!(extension, Some("json" | "jsonl" | "ndjson")),
+        Platform::All => false,
+    }
+}
+
+const HOOK_MARKER: &str = "cryo-vault:nightly-capture";
+const ANTIGRAVITY_HOOK_NAME: &str = "cryo-vault";
+
+#[derive(Debug, Clone)]
+struct HookTarget {
+    profile: HookProfile,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookSchema {
+    NestedMatcher,
+    DirectCommand,
+    CopilotCommand,
+    NamedCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCommandField {
+    Command,
+    Bash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookTimeoutUnits {
+    Seconds,
+    Milliseconds,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HookProfile {
+    platform: Platform,
+    global_path: &'static str,
+    event: &'static str,
+    schema: HookSchema,
+    command_field: HookCommandField,
+    timeout_field: &'static str,
+    timeout_value: u64,
+    timeout_units: HookTimeoutUnits,
+}
+
+const HOOK_PROFILES: [HookProfile; 5] = [
+    HookProfile {
+        platform: Platform::ClaudeCode,
+        global_path: ".claude/settings.json",
+        event: "SessionEnd",
+        schema: HookSchema::NestedMatcher,
+        command_field: HookCommandField::Command,
+        timeout_field: "timeout",
+        timeout_value: 2,
+        timeout_units: HookTimeoutUnits::Seconds,
+    },
+    HookProfile {
+        platform: Platform::Cursor,
+        global_path: ".cursor/hooks.json",
+        event: "sessionEnd",
+        schema: HookSchema::DirectCommand,
+        command_field: HookCommandField::Command,
+        timeout_field: "",
+        timeout_value: 0,
+        timeout_units: HookTimeoutUnits::Seconds,
+    },
+    HookProfile {
+        platform: Platform::GeminiCli,
+        global_path: ".gemini/settings.json",
+        event: "SessionEnd",
+        schema: HookSchema::NestedMatcher,
+        command_field: HookCommandField::Command,
+        timeout_field: "timeout",
+        timeout_value: 2000,
+        timeout_units: HookTimeoutUnits::Milliseconds,
+    },
+    HookProfile {
+        platform: Platform::CopilotCli,
+        global_path: ".copilot/hooks/cryo-vault.json",
+        event: "agentStop",
+        schema: HookSchema::CopilotCommand,
+        command_field: HookCommandField::Bash,
+        timeout_field: "timeoutSec",
+        timeout_value: 2,
+        timeout_units: HookTimeoutUnits::Seconds,
+    },
+    HookProfile {
+        platform: Platform::Antigravity,
+        global_path: ".gemini/config/hooks.json",
+        event: "Stop",
+        schema: HookSchema::NamedCommand,
+        command_field: HookCommandField::Command,
+        timeout_field: "timeout",
+        timeout_value: 2,
+        timeout_units: HookTimeoutUnits::Seconds,
+    },
+];
+
+fn hook_targets(platform: Platform, home: &Path) -> Vec<HookTarget> {
+    HOOK_PROFILES
+        .iter()
+        .copied()
+        .filter(|profile| platform == Platform::All || platform == profile.platform)
+        .map(|profile| HookTarget {
+            profile,
+            path: home.join(profile.global_path),
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookShell {
+    Unix,
+    PowerShell,
+}
+
+fn host_hook_shell() -> HookShell {
+    #[cfg(target_os = "windows")]
+    {
+        HookShell::PowerShell
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        HookShell::Unix
+    }
+}
+
+fn capture_executable() -> Result<PathBuf> {
+    let executable = std::env::var_os("CRYO_CAPTURE_COMMAND")
+        .map(PathBuf::from)
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                #[cfg(target_os = "windows")]
+                {
+                    let mut path = home.join(".cryo-vault/bin/cryo-vault");
+                    path.set_extension("exe");
+                    path
+                }
+                #[cfg(not(target_os = "windows"))]
+                home.join(".cryo-vault/bin/cryo-vault")
+            })
+        })
+        .ok_or_else(|| anyhow!("could not determine the installed cryo executable"))?;
+    Ok(executable)
+}
+
+fn capture_command_for_shell(platform: Platform, shell: HookShell) -> Result<String> {
+    let executable = capture_executable()?;
+    let path = executable.to_string_lossy();
+    let args = format!("capture hint --platform {} --stdin", platform.slug());
+    Ok(match shell {
+        HookShell::Unix => format!("{} {args}", shell_quote_unix(&path)),
+        HookShell::PowerShell => format!("& {} {args}", shell_quote_powershell(&path)),
+    })
+}
+
+fn shell_quote_unix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_quote_powershell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn json_object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+    )
+}
+
+fn hook_command(entry: &Value, profile: HookProfile) -> Option<&str> {
+    let field = if profile.schema == HookSchema::CopilotCommand {
+        match host_hook_shell() {
+            HookShell::Unix => "bash",
+            HookShell::PowerShell => "powershell",
+        }
+    } else {
+        match profile.command_field {
+            HookCommandField::Command => "command",
+            HookCommandField::Bash => "bash",
+        }
+    };
+    entry.get(field).and_then(Value::as_str)
+}
+
+fn is_cryo_command(command: &str, platform: Platform) -> bool {
+    command.contains(&format!(
+        "capture hint --platform {} --stdin",
+        platform.slug()
+    ))
+}
+
+fn is_marked_hook(entry: &Value, profile: HookProfile) -> bool {
+    entry.get("name").and_then(Value::as_str) == Some(HOOK_MARKER)
+        || hook_command(entry, profile)
+            .is_some_and(|command| is_cryo_command(command, profile.platform))
+}
+
+fn remove_marked_hooks_from_container(container: Option<&mut Value>, profile: HookProfile) -> bool {
+    let Some(events) = container.and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(event_hooks) = events.get_mut(profile.event).and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    event_hooks.retain_mut(|entry| {
+        if profile.schema == HookSchema::NestedMatcher {
+            if let Some(nested) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = nested.len();
+                nested.retain(|hook| !is_marked_hook(hook, profile));
+                changed |= nested.len() != before;
+                if nested.is_empty() && entry.get("matcher").is_some() {
+                    changed = true;
+                    return false;
+                }
+            }
+            true
+        } else if is_marked_hook(entry, profile) {
+            changed = true;
+            false
+        } else if profile.schema == HookSchema::DirectCommand
+            && let Some(nested) = entry.get_mut("hooks").and_then(Value::as_array_mut)
+        {
+            let before = nested.len();
+            nested.retain(|hook| !is_marked_hook(hook, profile));
+            changed |= nested.len() != before;
+            !(nested.is_empty() && entry.get("matcher").is_some())
+        } else {
+            true
+        }
+    });
+    changed
+}
+
+fn remove_marked_hooks(root: &mut Value, profile: HookProfile) -> bool {
+    let legacy_changed = if profile.schema == HookSchema::NamedCommand {
+        remove_marked_hooks_from_container(root.get_mut("hooks"), profile)
+    } else {
+        false
+    };
+    let container = if profile.schema == HookSchema::NamedCommand {
+        root.get_mut(ANTIGRAVITY_HOOK_NAME)
+    } else {
+        root.get_mut("hooks")
+    };
+    legacy_changed || remove_marked_hooks_from_container(container, profile)
+}
+
+fn hook_command_value(profile: HookProfile, command: &str, shell: HookShell) -> Value {
+    let field = if profile.schema == HookSchema::CopilotCommand {
+        match shell {
+            HookShell::Unix => "bash",
+            HookShell::PowerShell => "powershell",
+        }
+    } else {
+        match profile.command_field {
+            HookCommandField::Command => "command",
+            HookCommandField::Bash => "bash",
+        }
+    };
+    let mut object = Map::new();
+    if matches!(
+        profile.schema,
+        HookSchema::NestedMatcher | HookSchema::CopilotCommand
+    ) {
+        object.insert("type".into(), Value::String("command".into()));
+    }
+    if profile.schema == HookSchema::NestedMatcher {
+        object.insert("name".into(), Value::String(HOOK_MARKER.into()));
+    }
+    object.insert(field.into(), Value::String(command.into()));
+    if !profile.timeout_field.is_empty() {
+        let timeout_value = match profile.timeout_units {
+            HookTimeoutUnits::Seconds | HookTimeoutUnits::Milliseconds => profile.timeout_value,
+        };
+        object.insert(
+            profile.timeout_field.into(),
+            Value::Number(timeout_value.into()),
+        );
+    }
+    Value::Object(object)
+}
+
+fn render_hook_entry(profile: HookProfile, command: &str, shell: HookShell) -> Value {
+    let command_entry = hook_command_value(profile, command, shell);
+    match profile.schema {
+        HookSchema::NestedMatcher => json_object([
+            ("matcher", Value::String("*".into())),
+            ("hooks", Value::Array(vec![command_entry])),
+        ]),
+        HookSchema::DirectCommand | HookSchema::CopilotCommand | HookSchema::NamedCommand => {
+            command_entry
+        }
+    }
+}
+
+fn install_hook_file(target: &HookTarget, dry_run: bool) -> Result<()> {
+    let profile = target.profile;
+    let command = capture_command_for_shell(profile.platform, host_hook_shell())?;
+    install_hook_file_with_command(target, &command, dry_run)
+}
+
+fn install_hook_file_with_command(target: &HookTarget, command: &str, dry_run: bool) -> Result<()> {
+    let profile = target.profile;
+    let mut root = if target.path.exists() {
+        let bytes = fs::read(&target.path).with_context(|| {
+            format!(
+                "failed to read hook configuration {}",
+                target.path.display()
+            )
+        })?;
+        serde_json::from_slice::<Value>(&bytes).with_context(|| {
+            format!(
+                "failed to decode hook configuration {}",
+                target.path.display()
+            )
+        })?
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        return Err(anyhow!(
+            "hook configuration must be a JSON object: {}",
+            target.path.display()
+        ));
+    }
+    if matches!(
+        profile.schema,
+        HookSchema::CopilotCommand | HookSchema::DirectCommand
+    ) {
+        root.as_object_mut()
+            .expect("checked hook configuration object")
+            .entry("version")
+            .or_insert_with(|| Value::Number(1.into()));
+    }
+    remove_marked_hooks(&mut root, profile);
+    add_marked_hook(&mut root, profile, command, &target.path)?;
+
+    if !dry_run {
+        if let Some(parent) = target.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write_json(&target.path, &root)?;
+    }
+    Ok(())
+}
+
+fn add_marked_hook(
+    root: &mut Value,
+    profile: HookProfile,
+    command: &str,
+    path: &Path,
+) -> Result<()> {
+    let entry = render_hook_entry(profile, command, host_hook_shell());
+    let container_key = if profile.schema == HookSchema::NamedCommand {
+        ANTIGRAVITY_HOOK_NAME
+    } else {
+        "hooks"
+    };
+    let events = root
+        .as_object_mut()
+        .expect("checked hook configuration object")
+        .entry(container_key)
+        .or_insert_with(|| Value::Object(Map::new()));
+    let events = events
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("hook container must be a JSON object: {}", path.display()))?;
+    events
+        .entry(profile.event)
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("hook event must be a JSON array: {}", path.display()))?
+        .push(entry);
+    Ok(())
+}
+
+fn uninstall_hook_file(target: &HookTarget, dry_run: bool) -> Result<()> {
+    if !target.path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&target.path)?;
+    let mut root: Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to decode hook configuration {}",
+            target.path.display()
+        )
+    })?;
+    let changed = remove_marked_hooks(&mut root, target.profile);
+    if !changed || dry_run {
+        return Ok(());
+    }
+    if target.profile.schema == HookSchema::CopilotCommand && only_empty_hook_config(&root) {
+        fs::remove_file(&target.path)?;
+    } else {
+        atomic_write_json(&target.path, &root)?;
+    }
+    Ok(())
+}
+
+fn only_empty_hook_config(root: &Value) -> bool {
+    let Some(object) = root.as_object() else {
+        return false;
+    };
+    let hooks_empty = object
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|events| {
+            events
+                .values()
+                .all(|entries| entries.as_array().is_some_and(Vec::is_empty))
+        });
+    object.iter().all(|(key, value)| {
+        key == "version" || (key == "hooks" && value.as_object().is_some() && hooks_empty)
+    })
+}
+
+fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+pub fn install_hooks(platform: Platform, dry_run: bool) -> Result<Vec<PathBuf>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+    let targets = hook_targets(platform, &home);
+    for target in &targets {
+        install_hook_file(target, dry_run)?;
+    }
+    Ok(targets.into_iter().map(|target| target.path).collect())
+}
+
+pub fn uninstall_hooks(platform: Platform, dry_run: bool) -> Result<Vec<PathBuf>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+    let targets = hook_targets(platform, &home);
+    for target in &targets {
+        uninstall_hook_file(target, dry_run)?;
+    }
+    Ok(targets.into_iter().map(|target| target.path).collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HookStatus {
+    pub platform: Platform,
+    pub configuration_path: String,
+    pub event: String,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn hook_statuses() -> Result<Vec<HookStatus>> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+    Ok(hook_statuses_for_home(&home))
+}
+
+fn hook_statuses_for_home(home: &Path) -> Vec<HookStatus> {
+    hook_targets(Platform::All, home)
+        .into_iter()
+        .map(|target| {
+            let profile = target.profile;
+            let configuration_path = target.path.to_string_lossy().to_string();
+            let missing_reason = format!(
+                "hook is missing; run `cryo capture install --platform {}`",
+                profile.platform.slug()
+            );
+            let (installed, malformed) = if !target.path.exists() {
+                (false, false)
+            } else {
+                match fs::read(&target.path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
+                    Some(root) => profile_hook_state(&root, profile),
+                    None => (false, true),
+                }
+            };
+            let reason = if installed {
+                None
+            } else if malformed {
+                Some(format!(
+                    "hook configuration is malformed; run `cryo capture uninstall` then `cryo capture install --platform {}`",
+                    profile.platform.slug()
+                ))
+            } else {
+                Some(missing_reason)
+            };
+            HookStatus {
+                platform: profile.platform,
+                configuration_path,
+                event: profile.event.to_string(),
+                installed,
+                reason,
+            }
+        })
+        .collect()
+}
+
+fn profile_hook_state(root: &Value, profile: HookProfile) -> (bool, bool) {
+    let container_key = if profile.schema == HookSchema::NamedCommand {
+        ANTIGRAVITY_HOOK_NAME
+    } else {
+        "hooks"
+    };
+    let Some(container) = root.get(container_key) else {
+        return (false, false);
+    };
+    let Some(events) = container.as_object() else {
+        return (false, true);
+    };
+    let Some(entries) = events.get(profile.event) else {
+        return (false, false);
+    };
+    let Some(entries) = entries.as_array() else {
+        return (false, true);
+    };
+    for entry in entries {
+        match profile.schema {
+            HookSchema::NestedMatcher => {
+                let Some(nested) = entry.get("hooks").and_then(Value::as_array) else {
+                    continue;
+                };
+                for hook in nested {
+                    if is_marked_hook(hook, profile) {
+                        let valid = hook.get("type").and_then(Value::as_str) == Some("command")
+                            && hook_command(hook, profile).is_some()
+                            && hook.get(profile.timeout_field).and_then(Value::as_u64)
+                                == Some(profile.timeout_value);
+                        return (valid, !valid);
+                    }
+                }
+            }
+            HookSchema::DirectCommand | HookSchema::CopilotCommand | HookSchema::NamedCommand => {
+                if is_marked_hook(entry, profile) {
+                    let field = if profile.schema == HookSchema::CopilotCommand {
+                        match host_hook_shell() {
+                            HookShell::Unix => "bash",
+                            HookShell::PowerShell => "powershell",
+                        }
+                    } else {
+                        "command"
+                    };
+                    let valid = entry.get(field).and_then(Value::as_str).is_some()
+                        && (profile.timeout_field.is_empty()
+                            || entry.get(profile.timeout_field).and_then(Value::as_u64)
+                                == Some(profile.timeout_value));
+                    return (valid, !valid);
+                }
+            }
+        }
+    }
+    (false, false)
+}
+
+fn scheduler_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(home.join("Library/LaunchAgents"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(home.join(".config/systemd/user"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(home.join(".cryo-vault"));
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow!("unsupported operating system"))
+}
+
+pub fn scheduler_artifacts() -> Result<Vec<PathBuf>> {
+    let dir = scheduler_dir()?;
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(vec![dir.join("com.cryo-vault.nightly.plist")]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(vec![
+            dir.join("cryo-vault-nightly.service"),
+            dir.join("cryo-vault-nightly.timer"),
+        ]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Vec::new());
+    }
+    #[allow(unreachable_code)]
+    Ok(Vec::new())
+}
+
+#[allow(dead_code)]
+fn launchd_domain_for_uid(uid: &str) -> String {
+    format!("gui/{uid}")
+}
+
+#[allow(dead_code)]
+fn launchd_service_target_for_uid(uid: &str, label: &str) -> String {
+    format!("{}/{}", launchd_domain_for_uid(uid), label)
+}
+
+#[allow(dead_code)]
+fn launchd_plist(
+    executable: &Path,
+    db_path: &Path,
+    platform: Platform,
+    hour: u8,
+    minute: u8,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>com.cryo-vault.nightly</string><key>ProgramArguments</key><array><string>{}</string><string>--db</string><string>{}</string><string>capture</string><string>run</string><string>--platform</string><string>{}</string></array><key>StartCalendarInterval</key><dict><key>Hour</key><integer>{}</integer><key>Minute</key><integer>{}</integer></dict><key>RunAtLoad</key><false/><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string></dict></plist>\n",
+        xml_escape(&executable.to_string_lossy()),
+        xml_escape(&db_path.to_string_lossy()),
+        platform.slug(),
+        hour,
+        minute,
+        xml_escape(&db_path.join("capture.log").to_string_lossy()),
+        xml_escape(&db_path.join("capture.err.log").to_string_lossy())
+    )
+}
+
+#[allow(dead_code)]
+fn systemd_service_text(executable: &Path, db_path: &Path, platform: Platform) -> String {
+    format!(
+        "[Unit]\nDescription=Cryo Vault nightly conversation capture\n\n[Service]\nType=oneshot\nExecStart={} --db {} capture run --platform {}\n",
+        systemd_escape_path(&executable.to_string_lossy()),
+        systemd_escape_path(&db_path.to_string_lossy()),
+        platform.slug()
+    )
+}
+
+#[allow(dead_code)]
+fn systemd_timer_text(hour: u8, minute: u8) -> String {
+    format!(
+        "[Unit]\nDescription=Run Cryo Vault capture at {:02}:{:02} local time\n\n[Timer]\nOnCalendar=*-*-* {:02}:{:02}:00\nPersistent=true\nUnit=cryo-vault-nightly.service\n\n[Install]\nWantedBy=timers.target\n",
+        hour, minute, hour, minute
+    )
+}
+
+#[allow(dead_code)]
+fn windows_command_line(executable: &Path, db_path: &Path, platform: Platform) -> String {
+    format!(
+        "{} --db {} capture run --platform {}",
+        windows_quote(&executable.to_string_lossy()),
+        windows_quote(&db_path.to_string_lossy()),
+        platform.slug()
+    )
+}
+
+#[allow(dead_code)]
+fn windows_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+pub fn install_scheduler(
+    db_path: &Path,
+    platform: Platform,
+    time: &str,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>> {
+    let (hour, minute) = parse_schedule_time(time)?;
+    let executable = scheduler_executable()?;
+    #[cfg(target_os = "macos")]
+    {
+        let dir = scheduler_dir()?;
+        let path = dir.join("com.cryo-vault.nightly.plist");
+        let xml = launchd_plist(&executable, db_path, platform, hour, minute);
+        if !dry_run {
+            fs::create_dir_all(&dir)?;
+            if path.exists() && scheduler_installed()? {
+                run_checked(
+                    "launchctl",
+                    &[
+                        "bootout",
+                        &launchctl_service_target("com.cryo-vault.nightly")?,
+                    ],
+                    "could not unload the existing Cryo Vault LaunchAgent",
+                )?;
+            }
+            fs::write(&path, xml)?;
+            let domain = launchctl_domain()?;
+            run_checked(
+                "launchctl",
+                &["bootstrap", &domain, &path.to_string_lossy()],
+                "could not bootstrap the Cryo Vault LaunchAgent",
+            )?;
+            let target = launchctl_service_target("com.cryo-vault.nightly")?;
+            run_checked(
+                "launchctl",
+                &["kickstart", "-k", &target],
+                "could not start the Cryo Vault LaunchAgent",
+            )?;
+            let mut state = load_state(db_path)?;
+            state.schedule = Some(time.to_string());
+            save_state(db_path, &state)?;
+        }
+        return Ok(vec![path]);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = scheduler_dir()?;
+        let service = dir.join("cryo-vault-nightly.service");
+        let timer = dir.join("cryo-vault-nightly.timer");
+        let service_text = systemd_service_text(&executable, db_path, platform);
+        let timer_text = systemd_timer_text(hour, minute);
+        if !dry_run {
+            fs::create_dir_all(&dir)?;
+            fs::write(&service, service_text)?;
+            fs::write(&timer, timer_text)?;
+            run_checked(
+                "systemctl",
+                &["--user", "daemon-reload"],
+                "systemd could not reload the user unit files",
+            )?;
+            run_checked(
+                "systemctl",
+                &["--user", "enable", "--now", "cryo-vault-nightly.timer"],
+                "systemd could not enable the nightly capture timer",
+            )?;
+            run_checked(
+                "systemctl",
+                &[
+                    "--user",
+                    "is-enabled",
+                    "--quiet",
+                    "cryo-vault-nightly.timer",
+                ],
+                "systemd did not report the nightly capture timer as enabled",
+            )?;
+            let mut state = load_state(db_path)?;
+            state.schedule = Some(time.to_string());
+            save_state(db_path, &state)?;
+        }
+        return Ok(vec![service, timer]);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let task = "Cryo Vault Nightly Capture";
+        let command = windows_command_line(&executable, db_path, platform);
+        if !dry_run {
+            let status = std::process::Command::new("schtasks")
+                .args([
+                    "/Create",
+                    "/TN",
+                    task,
+                    "/SC",
+                    "DAILY",
+                    "/ST",
+                    &format!("{:02}:{:02}", hour, minute),
+                    "/TR",
+                    &command,
+                    "/F",
+                ])
+                .status()
+                .context("failed to invoke Task Scheduler")?;
+            if !status.success() {
+                return Err(anyhow!("Task Scheduler rejected the nightly capture task"));
+            }
+            let mut state = load_state(db_path)?;
+            state.schedule = Some(time.to_string());
+            save_state(db_path, &state)?;
+        }
+        return Ok(Vec::new());
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow!("unsupported operating system"))
+}
+
+pub fn uninstall_scheduler(dry_run: bool) -> Result<Vec<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        let paths = scheduler_artifacts()?;
+        if !dry_run {
+            if paths[0].exists() && scheduler_installed()? {
+                let target = launchctl_service_target("com.cryo-vault.nightly")?;
+                run_checked(
+                    "launchctl",
+                    &["bootout", &target],
+                    "could not unload the Cryo Vault LaunchAgent",
+                )?;
+            }
+            for path in &paths {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+        return Ok(paths);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let paths = scheduler_artifacts()?;
+        if !dry_run {
+            if paths.iter().any(|path| path.exists()) {
+                run_checked(
+                    "systemctl",
+                    &["--user", "disable", "--now", "cryo-vault-nightly.timer"],
+                    "systemd could not disable the nightly capture timer",
+                )?;
+            }
+            for path in &paths {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+            run_checked(
+                "systemctl",
+                &["--user", "daemon-reload"],
+                "systemd could not reload the user unit files",
+            )?;
+        }
+        return Ok(paths);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !dry_run {
+            let query = std::process::Command::new("schtasks")
+                .args(["/Query", "/TN", "Cryo Vault Nightly Capture"])
+                .status()
+                .context("failed to query Task Scheduler")?;
+            if query.success() {
+                run_checked(
+                    "schtasks",
+                    &["/Delete", "/TN", "Cryo Vault Nightly Capture", "/F"],
+                    "Task Scheduler could not remove the nightly capture task",
+                )?;
+            }
+        }
+        return Ok(Vec::new());
+    }
+    #[allow(unreachable_code)]
+    Err(anyhow!("unsupported operating system"))
+}
+
+pub fn scheduler_installed() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let target = launchctl_service_target("com.cryo-vault.nightly")?;
+        return Ok(std::process::Command::new("launchctl")
+            .args(["print", &target])
+            .output()
+            .is_ok_and(|output| output.status.success()));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "is-enabled",
+                "--quiet",
+                "cryo-vault-nightly.timer",
+            ])
+            .status()
+            .is_ok_and(|status| status.success()));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", "Cryo Vault Nightly Capture"])
+            .output()
+            .is_ok_and(|o| o.status.success()));
+    }
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+fn scheduler_executable() -> Result<PathBuf> {
+    std::env::var_os("CRYO_CAPTURE_COMMAND")
+        .map(PathBuf::from)
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                #[cfg(target_os = "windows")]
+                {
+                    let mut path = home.join(".cryo-vault/bin/cryo-vault");
+                    path.set_extension("exe");
+                    path
+                }
+                #[cfg(not(target_os = "windows"))]
+                home.join(".cryo-vault/bin/cryo-vault")
+            })
+        })
+        .ok_or_else(|| anyhow!("could not determine the installed cryo executable"))
+}
+
+fn run_checked(program: &str, args: &[&str], context: &str) -> Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("{context}: failed to invoke {program}"))?;
+    if !status.success() {
+        return Err(anyhow!("{context} (exit status {status})"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_domain() -> Result<String> {
+    let output = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .context("could not determine the current macOS user")?;
+    if !output.status.success() {
+        return Err(anyhow!("could not determine the current macOS user"));
+    }
+    let uid = String::from_utf8(output.stdout)?.trim().to_string();
+    Ok(launchd_domain_for_uid(&uid))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_service_target(label: &str) -> Result<String> {
+    let domain = launchctl_domain()?;
+    Ok(format!("{domain}/{label}"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[allow(dead_code)]
+fn systemd_escape_path(value: &str) -> String {
+    value.replace(' ', "\\x20")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn parses_claude_like_jsonl_and_omits_reasoning() {
+        let input = br#"{"sessionId":"abc","type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the nightly collector"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"I will inspect it"}]}}
+{"type":"tool_result","content":"cargo test"}"#;
+        let sessions =
+            parse_transcript(Platform::ClaudeCode, Path::new("session.jsonl"), input).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 3);
+        assert!(!sessions[0].extract_full_text().contains("secret"));
+    }
+
+    #[test]
+    fn capture_is_stable_and_unchanged_on_second_run() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("session.json");
+        fs::write(
+            &file,
+            json!({"session_id":"one","messages":[{"role":"user","content":"hello"}]}).to_string(),
+        )
+        .unwrap();
+        let db = dir.path().join("db");
+        let options = CaptureOptions {
+            stable_age_secs: 0,
+            ..Default::default()
+        };
+        let roots = vec![(Platform::Generic, root)];
+        let first = run_with_roots(&db, &options, &roots).unwrap();
+        let second = run_with_roots(&db, &options, &roots).unwrap();
+        assert_eq!(first.imported_sessions, 0);
+        assert_eq!(second.imported_sessions, 1);
+        assert!(
+            run_with_roots(&db, &options, &roots)
+                .unwrap()
+                .skipped_unchanged
+                > 0
+        );
+    }
+
+    #[test]
+    fn versioned_platform_fixtures_extract_visible_sessions() {
+        let fixtures = [
+            (Platform::Codex, "codex-v1.jsonl", "codex-fixture-1"),
+            (
+                Platform::ClaudeCode,
+                "claude-code-v1.jsonl",
+                "claude-fixture-1",
+            ),
+            (
+                Platform::CopilotCli,
+                "copilot-cli-v1.jsonl",
+                "copilot-fixture-1",
+            ),
+            (Platform::Cursor, "cursor-v1.jsonl", "cursor-fixture-1"),
+            (
+                Platform::GeminiCli,
+                "gemini-cli-v1.jsonl",
+                "gemini-fixture-1",
+            ),
+            (
+                Platform::Antigravity,
+                "antigravity-v1.jsonl",
+                "antigravity-fixture-1",
+            ),
+        ];
+        for (platform, name, source_id) in fixtures {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/capture")
+                .join(name);
+            let input = fs::read(&path).unwrap();
+            let sessions = parse_transcript(platform, &path, &input).unwrap();
+            assert_eq!(sessions.len(), 1, "{platform}");
+            assert_eq!(sessions[0].messages.len(), 3, "{platform}");
+            assert_eq!(
+                metadata_value(&sessions[0], "platform_session_id").as_deref(),
+                Some(source_id)
+            );
+            assert!(!sessions[0].title.as_deref().unwrap().is_empty());
+            assert_eq!(metadata_u64(&sessions[0], "capture_revision"), Some(1));
+            assert!(
+                !sessions[0]
+                    .extract_full_text()
+                    .contains("private reasoning")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_and_partial_jsonl_keep_valid_records() {
+        let input = br#"not json
+{"type":"user","sessionId":"partial","content":"keep this"}
+{"type":"assistant","content":[{"type":"text","text":"and this"}]}"#;
+        let sessions =
+            parse_transcript(Platform::Codex, Path::new("partial.jsonl"), input).unwrap();
+        assert_eq!(sessions[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn a_path_hint_bypasses_stability_and_is_consumed() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("session.json");
+        fs::write(
+            &file,
+            json!({"session_id":"hinted","messages":[{"role":"user","content":"hello"}]})
+                .to_string(),
+        )
+        .unwrap();
+        let db = dir.path().join("db");
+        record_hook_hint(
+            &db,
+            HookHint {
+                platform: Platform::Generic,
+                session_id: Some("hinted".into()),
+                path: Some(file.to_string_lossy().into()),
+                seen_at: now_secs(),
+            },
+        )
+        .unwrap();
+
+        let report = run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
+        assert_eq!(report.imported_sessions, 1);
+        assert!(load_state(&db).unwrap().pending_hooks.is_empty());
+    }
+
+    #[test]
+    fn pathless_hints_are_retained_until_a_session_resolves() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        record_hook_hint(
+            &db,
+            HookHint {
+                platform: Platform::ClaudeCode,
+                session_id: Some("not-yet-on-disk".into()),
+                path: None,
+                seen_at: now_secs(),
+            },
+        )
+        .unwrap();
+        run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
+        assert_eq!(load_state(&db).unwrap().pending_hooks.len(), 1);
+    }
+
+    #[test]
+    fn discovery_uses_platform_allowlists() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("copilot");
+        fs::create_dir_all(root.join("session-state")).unwrap();
+        fs::write(root.join("settings.json"), "{}").unwrap();
+        fs::write(root.join("session-state/session.json"), "{}").unwrap();
+        let candidates = discover_candidates(&[(Platform::CopilotCli, root)]);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].path.ends_with("session.json"));
+    }
+
+    #[test]
+    fn hook_merge_is_idempotent_and_preserves_unrelated_configuration() {
+        let mut root = json!({
+            "permissions": {"allow": ["cargo test"]},
+            "hooks": {"SessionEnd": [{
+                "matcher": "*",
+                "hooks": [{"name": "user-hook", "type": "command", "command": "user-command"}]
+            }]}
+        });
+        add_marked_hook(
+            &mut root,
+            HOOK_PROFILES[0],
+            "cryo capture hint --stdin",
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        remove_marked_hooks(&mut root, HOOK_PROFILES[0]);
+        add_marked_hook(
+            &mut root,
+            HOOK_PROFILES[0],
+            "cryo capture hint --stdin",
+            Path::new("settings.json"),
+        )
+        .unwrap();
+        let serialized = root.to_string();
+        assert!(serialized.contains("user-command"));
+        assert_eq!(serialized.matches(HOOK_MARKER).count(), 1);
+        assert!(serialized.contains("cargo test"));
+    }
+
+    #[test]
+    fn all_hook_targets_exclude_scanner_only_codex() {
+        let targets = hook_targets(Platform::All, Path::new("/tmp/cryo-home"));
+        assert_eq!(targets.len(), 5);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.profile.platform != Platform::Codex)
+        );
+        assert!(hook_targets(Platform::Codex, Path::new("/tmp/cryo-home")).is_empty());
+    }
+
+    #[test]
+    fn native_hook_snapshots_match_each_client_schema() {
+        let command = "/opt/Cryo Vault/bin/cryo-vault capture hint --platform claude-code --stdin";
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[0], command, HookShell::Unix),
+            json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "name": HOOK_MARKER,
+                    "command": command,
+                    "timeout": 2
+                }]
+            })
+        );
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[1], command, HookShell::Unix),
+            json!({"command": command})
+        );
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[2], command, HookShell::Unix),
+            json!({
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "name": HOOK_MARKER,
+                    "command": command,
+                    "timeout": 2000
+                }]
+            })
+        );
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[3], command, HookShell::Unix),
+            json!({"type": "command", "bash": command, "timeoutSec": 2})
+        );
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[3], command, HookShell::PowerShell),
+            json!({"type": "command", "powershell": command, "timeoutSec": 2})
+        );
+        assert_eq!(
+            render_hook_entry(HOOK_PROFILES[4], command, HookShell::Unix),
+            json!({"command": command, "timeout": 2})
+        );
+        assert_eq!(HOOK_PROFILES[3].event, "agentStop");
+    }
+
+    #[test]
+    fn hook_install_repeat_and_uninstall_preserve_unrelated_settings() {
+        let dir = TempDir::new().unwrap();
+        for profile in HOOK_PROFILES {
+            let path = dir.path().join(profile.global_path);
+            let target = HookTarget {
+                profile,
+                path: path.clone(),
+            };
+            let root = json!({
+                "permissions": {"allow": ["user-command"]},
+                "hooks": {profile.event: []}
+            });
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec(&root).unwrap()).unwrap();
+            let command = format!(
+                "'/opt/Cryo Vault/bin/cryo-vault' capture hint --platform {} --stdin",
+                profile.platform.slug()
+            );
+            install_hook_file_with_command(&target, &command, false).unwrap();
+            install_hook_file_with_command(&target, &command, false).unwrap();
+            let installed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                installed["permissions"]["allow"][0],
+                Value::String("user-command".into())
+            );
+            if profile.schema == HookSchema::NamedCommand {
+                assert!(installed.get("hooks").is_some());
+                assert_eq!(
+                    installed[ANTIGRAVITY_HOOK_NAME][profile.event]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(profile_hook_state(&installed, profile).0);
+            } else {
+                assert_eq!(
+                    installed["hooks"][profile.event].as_array().unwrap().len(),
+                    1
+                );
+            }
+            uninstall_hook_file(&target, false).unwrap();
+            let uninstalled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                uninstalled["permissions"]["allow"][0],
+                Value::String("user-command".into())
+            );
+            if profile.schema == HookSchema::NamedCommand {
+                assert!(
+                    uninstalled[ANTIGRAVITY_HOOK_NAME][profile.event]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(!profile_hook_state(&uninstalled, profile).0);
+            } else {
+                assert!(
+                    uninstalled["hooks"][profile.event]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_uses_named_top_level_hook_and_status_ignores_legacy_shape() {
+        let profile = HOOK_PROFILES[4];
+        let command = "cryo capture hint --platform antigravity --stdin";
+        let mut legacy = json!({
+            "hooks": {profile.event: [render_hook_entry(profile, command, HookShell::Unix)]}
+        });
+        assert_eq!(profile_hook_state(&legacy, profile), (false, false));
+        assert!(remove_marked_hooks(&mut legacy, profile));
+        add_marked_hook(&mut legacy, profile, command, Path::new("hooks.json")).unwrap();
+        assert!(legacy[ANTIGRAVITY_HOOK_NAME][profile.event].is_array());
+        assert!(
+            legacy["hooks"][profile.event]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(profile_hook_state(&legacy, profile).0);
+    }
+
+    #[test]
+    fn queue_preserves_concurrent_hints_and_consumes_them_once() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let mut files = Vec::new();
+        for index in 0..12 {
+            let path = dir.path().join(format!("session-{index}.json"));
+            fs::write(
+                &path,
+                json!({
+                    "session_id": format!("queued-{index}"),
+                    "messages": [{"role": "user", "content": format!("queued {index}")}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            files.push(path);
+        }
+        let handles = files
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let db = db.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    record_hook_hint(
+                        &db,
+                        HookHint {
+                            platform: Platform::Generic,
+                            session_id: Some(format!("queued-{index}")),
+                            path: Some(path.to_string_lossy().into()),
+                            seen_at: index as u64,
+                        },
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let queue = db.join(HINT_QUEUE_DIR);
+        assert_eq!(fs::read_dir(&queue).unwrap().count(), files.len());
+        let report = run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
+        assert_eq!(report.imported_sessions, files.len());
+        assert!(load_state(&db).unwrap().pending_hooks.is_empty());
+        assert!(!queue.exists());
+        let second = run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
+        assert_eq!(second.imported_sessions, 0);
+    }
+
+    #[test]
+    fn antigravity_discovery_only_accepts_cli_transcripts() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("antigravity-cli");
+        let logs = root.join("brain/id/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), "{}").unwrap();
+        fs::write(logs.join("transcript_full.jsonl"), "{}").unwrap();
+        for excluded in ["history", "cache", "settings", "database"] {
+            let excluded_dir = root.join(excluded);
+            fs::create_dir_all(&excluded_dir).unwrap();
+            fs::write(excluded_dir.join("transcript.jsonl"), "{}").unwrap();
+        }
+        let candidates = discover_candidates(&[(Platform::Antigravity, root)]);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0]
+                .path
+                .ends_with(".system_generated/logs/transcript.jsonl")
+        );
+    }
+
+    #[test]
+    fn scheduler_command_helpers_quote_and_target_each_os() {
+        assert_eq!(launchd_domain_for_uid("42"), "gui/42");
+        assert_eq!(
+            launchd_service_target_for_uid("42", "com.cryo-vault.nightly"),
+            "gui/42/com.cryo-vault.nightly"
+        );
+        let executable = Path::new("C:/Program Files/Cryo Vault/cryo-vault.exe");
+        let db = Path::new("C:/Users/A User/.cryo");
+        assert_eq!(
+            windows_command_line(executable, db, Platform::All),
+            "\"C:/Program Files/Cryo Vault/cryo-vault.exe\" --db \"C:/Users/A User/.cryo\" capture run --platform all"
+        );
+        assert!(systemd_timer_text(1, 15).contains("OnCalendar=*-*-* 01:15:00"));
+        assert!(
+            launchd_plist(
+                Path::new("/bin/cryo"),
+                Path::new("/db"),
+                Platform::All,
+                23,
+                0
+            )
+            .contains("<integer>23</integer>")
+        );
+    }
+}

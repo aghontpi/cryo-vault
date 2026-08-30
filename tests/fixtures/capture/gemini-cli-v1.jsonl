@@ -1,0 +1,3 @@
+{"sessionId":"gemini-fixture-1","timestamp":1700000004,"model":"gemini-model","type":"user","content":"Check Gemini capture"}
+{"sessionId":"gemini-fixture-1","type":"model","content":"The settings file is not a transcript."}
+{"sessionId":"gemini-fixture-1","type":"tool_result","content":"scan complete"}

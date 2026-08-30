@@ -1,0 +1,3 @@
+{"sessionId":"claude-fixture-1","timestamp":1700000001,"model":"claude-sonnet","type":"user","message":{"role":"user","content":[{"type":"text","text":"Review the capture hook"}]}}
+{"sessionId":"claude-fixture-1","type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning"},{"type":"text","text":"The hook should be non-blocking."}]}}
+{"sessionId":"claude-fixture-1","type":"tool_result","content":"hook complete"}

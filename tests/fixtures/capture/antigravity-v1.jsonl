@@ -1,0 +1,3 @@
+{"conversationId":"antigravity-fixture-1","timestamp":1700000005,"model":"antigravity-model","role":"user","content":"Check Antigravity transcript paths"}
+{"conversationId":"antigravity-fixture-1","role":"assistant","content":"Use the IDE transcript.jsonl layout."}
+{"conversationId":"antigravity-fixture-1","role":"tool","content":"path verified"}

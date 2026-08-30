@@ -1,3 +1,5 @@
+/// Nightly local transcript discovery, parsing, and scheduling.
+pub mod capture;
 /// Indexing and search logic (Bloom filters, BlockIndex).
 pub mod index;
 /// File locking mechanism for concurrency safety.
@@ -43,4 +45,3 @@ mod aarch64_windows_stubs {
         udivmod128(n, d).1
     }
 }
-

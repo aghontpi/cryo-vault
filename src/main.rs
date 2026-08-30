@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
 
+use cryo_vault::capture::{self, CaptureOptions, HookHint, Platform};
 use cryo_vault::lock::CryoLock;
 use cryo_vault::schema::{ChatGptConversation, ChatSessionInput, ChatSessionV1, StreamEvent};
 use cryo_vault::storage::Storage;
@@ -27,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Discover and archive local coding-agent transcripts
+    Capture {
+        #[command(subcommand)]
+        command: CaptureCommands,
+    },
     /// Ingest a chat log (File or Stdin)
     Add {
         /// Input file (Use "-" for stdin)
@@ -98,6 +104,59 @@ enum Commands {
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CaptureCommands {
+    /// Run one capture pass
+    Run {
+        /// Source platform to scan (default: all)
+        #[arg(long, default_value = "all")]
+        platform: String,
+        /// Scheduled time used for validation and reporting
+        #[arg(long, default_value = "23:00")]
+        time: String,
+        /// Inspect and parse without writing archive or state files
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Install the native nightly scheduler
+    Install {
+        /// Source platform to document in the scheduled job (default: all)
+        #[arg(long, default_value = "all")]
+        platform: String,
+        /// Local time in HH:MM format
+        #[arg(long, default_value = "23:00")]
+        time: String,
+        /// Show scheduler changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show capture state and scheduler status
+    Status {
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the native nightly scheduler (archive data is retained)
+    Uninstall {
+        /// Show scheduler changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record a lightweight end-of-session hint for the next collector run
+    #[command(hide = true)]
+    Hint {
+        #[arg(long)]
+        platform: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Read session_id/transcript_path from the lifecycle hook's JSON stdin.
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -458,11 +517,8 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     // Block-count denominator: the existing index may be truncated /
     // out-of-sync, so `stats` would lie. A header-only scan of the data
     // file gives the real number cheaply (no decompression).
-    let total_blocks = match storage.count_archive_blocks() {
-        Ok(n) => n,
-        // No data yet — fall through to reindex, which will short-circuit.
-        Err(_) => 0,
-    };
+    // No data yet — fall through to reindex, which will short-circuit.
+    let total_blocks = storage.count_archive_blocks().unwrap_or_default();
     let pb = make_progress_bar(total_blocks);
 
     let result = storage.reindex_with_progress(|| {
@@ -559,6 +615,190 @@ fn handle_flush(db_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn handle_capture(db_path: PathBuf, command: CaptureCommands) -> Result<()> {
+    match command {
+        CaptureCommands::Run {
+            platform,
+            time,
+            dry_run,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let options = CaptureOptions {
+                platform,
+                time,
+                dry_run,
+                ..Default::default()
+            };
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let report = capture::run(&db_path, &options)?;
+            println!(
+                "Capture: discovered {}, stable {}, imported {}, unchanged {}, unstable {}, failed {}{}",
+                report.discovered_files,
+                report.stable_files,
+                report.imported_sessions,
+                report.skipped_unchanged,
+                report.skipped_unstable,
+                report.failed_files,
+                if dry_run { " (dry-run)" } else { "" }
+            );
+        }
+        CaptureCommands::Install {
+            platform,
+            time,
+            dry_run,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let mut paths = capture::install_scheduler(&db_path, platform, &time, dry_run)?;
+            paths.extend(capture::install_hooks(platform, dry_run)?);
+            if dry_run {
+                println!("Would install nightly capture at {}", time);
+            } else {
+                println!("Nightly capture installed for {}", time);
+            }
+            for path in paths {
+                println!("  {}", path.display());
+            }
+        }
+        CaptureCommands::Status { json: as_json } => {
+            let state = capture::load_state(&db_path)?;
+            let installed = capture::scheduler_installed()?;
+            let hooks = capture::hook_statuses()?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "installed": installed,
+                        "last_run_at": state.last_run_at,
+                        "tracked_files": state.files.len(),
+                        "pending_hook_hints": state.pending_hooks.len(),
+                        "schedule": state.schedule.as_deref().unwrap_or("23:00"),
+                        "hooks": hooks
+                    }))?
+                );
+            } else {
+                println!(
+                    "Nightly capture: {}",
+                    if installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    }
+                );
+                println!(
+                    "Schedule:        {} local time",
+                    state.schedule.as_deref().unwrap_or("23:00")
+                );
+                println!("Tracked files:   {}", state.files.len());
+                println!("Pending hints:   {}", state.pending_hooks.len());
+                println!("Hooks:");
+                for hook in hooks {
+                    println!(
+                        "  {:<13} {} ({}){}",
+                        hook.platform,
+                        if hook.installed {
+                            "installed"
+                        } else {
+                            "missing"
+                        },
+                        hook.configuration_path,
+                        hook.reason
+                            .as_deref()
+                            .map(|reason| format!(" — {reason}"))
+                            .unwrap_or_default()
+                    );
+                }
+                if let Some(last_run) = state.last_run_at {
+                    println!("Last run:        {}", last_run);
+                }
+            }
+        }
+        CaptureCommands::Uninstall { dry_run } => {
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let mut paths = capture::uninstall_scheduler(dry_run)?;
+            paths.extend(capture::uninstall_hooks(Platform::All, dry_run)?);
+            if !dry_run {
+                capture::clear_schedule(&db_path)?;
+            }
+            println!(
+                "{} nightly capture scheduler{}.",
+                if dry_run { "Would remove" } else { "Removed" },
+                if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({})",
+                        paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            );
+        }
+        CaptureCommands::Hint {
+            platform,
+            session_id,
+            path,
+            stdin,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let (session_id, path) = if stdin {
+                let mut payload = String::new();
+                io::stdin().read_to_string(&mut payload)?;
+                let value = serde_json::from_str::<serde_json::Value>(&payload).unwrap_or_default();
+                let session_id = session_id.or_else(|| {
+                    value
+                        .get("session_id")
+                        .or_else(|| value.get("sessionId"))
+                        .or_else(|| value.get("conversation_id"))
+                        .or_else(|| value.get("conversationId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+                let path = path.or_else(|| {
+                    value
+                        .get("transcript_path")
+                        .or_else(|| value.get("transcriptPath"))
+                        .or_else(|| value.get("transcript_pathname"))
+                        .or_else(|| value.get("path"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from)
+                });
+                (session_id, path)
+            } else {
+                (session_id, path)
+            };
+            capture::record_hook_hint(
+                &db_path,
+                HookHint {
+                    platform,
+                    session_id,
+                    path: path.map(|p| p.to_string_lossy().to_string()),
+                    seen_at: chrono::Utc::now().timestamp().max(0) as u64,
+                },
+            )?;
+            // Hook clients receive exactly one JSON result on stdout. Tracing
+            // is configured for stderr, so no transcript content is emitted.
+            println!("{{\"queued\":true}}");
+        }
+    }
+    Ok(())
+}
+
 /// Main entry point for the Cryo CLI.
 /// Handles command parsing and dispatching to appropriate storage operations.
 fn main() -> Result<()> {
@@ -580,6 +820,7 @@ fn main() -> Result<()> {
 
     // 2. Dispatch
     match cli.command {
+        Commands::Capture { command } => handle_capture(db_path, command)?,
         Commands::Add { file, stream } => handle_add(db_path, file, stream)?,
         Commands::Flush => handle_flush(db_path)?,
         Commands::Search {
