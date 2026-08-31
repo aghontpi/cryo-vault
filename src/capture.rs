@@ -10,12 +10,12 @@ use anyhow::{Context, Result, anyhow};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::schema::{ChatGptConversation, ChatSessionV1, MessageRole, MessageV1};
@@ -100,6 +100,7 @@ pub struct CaptureOptions {
     pub platform: Platform,
     pub dry_run: bool,
     pub time: String,
+    pub settle: Option<Duration>,
     /// Retained for API compatibility; stability is now based on two
     /// identical observations (or a concrete lifecycle hint).
     pub stable_age_secs: u64,
@@ -111,9 +112,42 @@ impl Default for CaptureOptions {
             platform: Platform::All,
             dry_run: false,
             time: DEFAULT_CAPTURE_TIME.to_string(),
+            settle: None,
             stable_age_secs: DEFAULT_STABLE_AGE_SECS,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateReport {
+    pub platform: Platform,
+    pub path: String,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Streaming diagnostics emitted while a capture pass is running.  Events
+/// intentionally contain paths and classification only; transcript bodies
+/// never cross this boundary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum CaptureEvent {
+    DiscoveryStarted {
+        pass: u8,
+        candidates: usize,
+    },
+    Candidate {
+        pass: u8,
+        platform: Platform,
+        path: String,
+        outcome: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    PassCompleted {
+        pass: u8,
+    },
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -124,9 +158,14 @@ pub struct CaptureReport {
     pub skipped_unchanged: usize,
     pub skipped_unstable: usize,
     pub skipped_empty: usize,
+    pub skipped_unsupported: usize,
     pub failed_files: usize,
     pub hook_hints: usize,
     pub dry_run: bool,
+    pub discovered_by_platform: BTreeMap<String, usize>,
+    pub candidates: Vec<CandidateReport>,
+    #[serde(default)]
+    pub extraction_metrics: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -182,9 +221,45 @@ pub fn parse_schedule_time(value: &str) -> Result<(u8, u8)> {
     Ok((hour, minute))
 }
 
+/// Parse the compact duration syntax accepted by `capture run --settle`.
+/// Bare numbers are seconds; suffixes are `ms`, `s`, `m`, or `h`.
+pub fn parse_settle_duration(value: &str) -> Result<Duration> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Err(anyhow!("settle duration must be a positive duration"));
+    }
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else {
+        (value.as_str(), 1_000)
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| anyhow!("settle duration must be an integer followed by ms, s, m, or h"))?;
+    let milliseconds = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("settle duration is too large"))?;
+    Ok(Duration::from_millis(milliseconds))
+}
+
 pub fn run(db_path: &Path, options: &CaptureOptions) -> Result<CaptureReport> {
     let roots = default_roots(options.platform);
     run_with_roots(db_path, options, &roots)
+}
+
+pub fn run_with_observer(
+    db_path: &Path,
+    options: &CaptureOptions,
+    observer: &mut dyn FnMut(CaptureEvent),
+) -> Result<CaptureReport> {
+    let roots = default_roots(options.platform);
+    run_with_roots_observer(db_path, options, &roots, observer)
 }
 
 /// Testable form of [`run`]. Each tuple is a platform-specific discovery root.
@@ -192,6 +267,36 @@ pub fn run_with_roots(
     db_path: &Path,
     options: &CaptureOptions,
     roots: &[(Platform, PathBuf)],
+) -> Result<CaptureReport> {
+    run_with_roots_observer(db_path, options, roots, &mut |_| {})
+}
+
+pub fn run_with_roots_observer(
+    db_path: &Path,
+    options: &CaptureOptions,
+    roots: &[(Platform, PathBuf)],
+    observer: &mut dyn FnMut(CaptureEvent),
+) -> Result<CaptureReport> {
+    let first = run_once(db_path, options, roots, 1, observer)?;
+    if options.dry_run || options.settle.is_none() || first.skipped_unstable == 0 {
+        return Ok(first);
+    }
+
+    if let Some(settle) = options.settle {
+        std::thread::sleep(settle);
+    }
+    let mut second_options = options.clone();
+    second_options.settle = None;
+    let second = run_once(db_path, &second_options, roots, 2, observer)?;
+    Ok(merge_settled_reports(first, second))
+}
+
+fn run_once(
+    db_path: &Path,
+    options: &CaptureOptions,
+    roots: &[(Platform, PathBuf)],
+    pass: u8,
+    observer: &mut dyn FnMut(CaptureEvent),
 ) -> Result<CaptureReport> {
     parse_schedule_time(&options.time)?;
     // The CLI holds the database lock while this function runs. Hooks never
@@ -225,15 +330,42 @@ pub fn run_with_roots(
         hook_hints: state.pending_hooks.len(),
         ..Default::default()
     };
+    observer(CaptureEvent::DiscoveryStarted {
+        pass,
+        candidates: candidates.len(),
+    });
+    for candidate in &candidates {
+        *report
+            .discovered_by_platform
+            .entry(candidate.platform.slug().to_string())
+            .or_default() += 1;
+    }
     let storage = Storage::new(db_path.to_path_buf());
+    let archived_sessions = storage.scan_all()?;
+    let archived_duplicate_keys = archived_sessions
+        .iter()
+        .filter_map(session_duplicate_key)
+        .collect::<HashSet<_>>();
     let mut imports = Vec::new();
+    let mut pending_duplicate_keys = HashSet::new();
     let mut resolved_hint_paths = HashSet::new();
     let mut resolved_session_ids = HashSet::new();
 
     for candidate in candidates {
         let metadata = match fs::metadata(&candidate.path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(error) => {
+                report.failed_files += 1;
+                add_candidate_report(
+                    &mut report,
+                    &candidate,
+                    "failed",
+                    Some(format!("could not inspect transcript: {error}")),
+                    pass,
+                    observer,
+                );
+                continue;
+            }
         };
         let size = metadata.len();
         let modified_at = metadata
@@ -247,6 +379,14 @@ pub fn run_with_roots(
             Err(error) => {
                 tracing::warn!(path = %candidate.path.display(), %error, "capture could not read transcript");
                 report.failed_files += 1;
+                add_candidate_report(
+                    &mut report,
+                    &candidate,
+                    "failed",
+                    Some("could not read transcript".to_string()),
+                    pass,
+                    observer,
+                );
                 continue;
             }
         };
@@ -282,12 +422,31 @@ pub fn run_with_roots(
 
         if !stable {
             report.skipped_unstable += 1;
+            add_candidate_report(
+                &mut report,
+                &candidate,
+                "awaiting second observation",
+                Some(
+                    "first observation recorded; waiting for an unchanged second observation"
+                        .to_string(),
+                ),
+                pass,
+                observer,
+            );
             continue;
         }
         report.stable_files += 1;
 
         if already_captured {
             report.skipped_unchanged += 1;
+            add_candidate_report(
+                &mut report,
+                &candidate,
+                "unchanged",
+                Some("duplicate already archived".to_string()),
+                pass,
+                observer,
+            );
             continue;
         }
 
@@ -296,38 +455,134 @@ pub fn run_with_roots(
             Err(error) => {
                 tracing::warn!(path = %candidate.path.display(), %error, "capture skipped malformed transcript");
                 report.failed_files += 1;
+                add_candidate_report(
+                    &mut report,
+                    &candidate,
+                    "failed",
+                    Some("malformed transcript".to_string()),
+                    pass,
+                    observer,
+                );
                 continue;
             }
         };
         if sessions.is_empty() {
             report.skipped_empty += 1;
+            let reason = if bytes.iter().any(|byte| !byte.is_ascii_whitespace())
+                && (serde_json::from_slice::<Value>(&bytes).is_ok()
+                    || bytes
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+                        .all(|line| serde_json::from_slice::<Value>(line).is_ok()))
+            {
+                report.skipped_unsupported += 1;
+                "unsupported source record"
+            } else {
+                "empty transcript"
+            };
+            add_candidate_report(
+                &mut report,
+                &candidate,
+                "empty",
+                Some(reason.to_string()),
+                pass,
+                observer,
+            );
             continue;
+        }
+        if let Some(session) = sessions.first()
+            && let Ok(metadata) = serde_json::from_str::<Value>(&session.metadata_json)
+        {
+            report.extraction_metrics.insert(
+                candidate.path.to_string_lossy().into_owned(),
+                serde_json::json!({
+                    "records_read": metadata.get("records_read").cloned().unwrap_or(Value::Null),
+                    "visible_messages_extracted": metadata.get("visible_messages_extracted").cloned().unwrap_or(Value::Null),
+                    "records_skipped_by_reason": metadata.get("records_skipped_by_reason").cloned().unwrap_or(Value::Null),
+                    "malformed_records": metadata.get("malformed_records").cloned().unwrap_or(Value::Null)
+                }),
+            );
         }
         if hinted_path {
             resolved_hint_paths.insert(candidate.path.clone());
         }
 
+        let mut imported_from_candidate = false;
         for mut session in sessions {
             if let Some(source_id) = metadata_value(&session, "platform_session_id") {
                 resolved_session_ids.insert(source_id);
             }
-            let existing = storage.get_session_by_id(&session.id)?;
+            let source_id = metadata_value(&session, "platform_session_id")
+                .filter(|id| !id.is_empty() && id != "unknown");
+            let existing = match storage.get_session_by_id(&session.id)? {
+                Some(existing) => Some(existing),
+                None if source_id.is_none() => {
+                    // Older capture builds used the content fingerprint as
+                    // the fallback session ID. Recover the path identity for
+                    // changed transcripts so their revisions still replace
+                    // the same logical record.
+                    archived_sessions
+                        .iter()
+                        .find(|archived| {
+                            metadata_value(archived, "source_path").as_deref() == Some(key.as_str())
+                                && metadata_platform(archived) == metadata_platform(&session)
+                        })
+                        .cloned()
+                }
+                None => None,
+            };
+            let session_fingerprint = fingerprint_for_session(&session);
             let is_unchanged = existing
                 .as_ref()
                 .and_then(|existing| metadata_value(existing, "content_fingerprint"))
-                .is_some_and(|old| old == fingerprint_for_session(&session));
-            if is_unchanged {
+                .is_some_and(|old| old == session_fingerprint);
+            let duplicate_key = source_id.is_none().then(|| {
+                canonical_duplicate_key(
+                    &metadata_platform(&session),
+                    &normalized_visible_message_fingerprint(&session),
+                )
+            });
+            let duplicate_archived = duplicate_key
+                .as_ref()
+                .is_some_and(|key| archived_duplicate_keys.contains(key));
+            let duplicate_in_pass = duplicate_key
+                .as_ref()
+                .is_some_and(|key| pending_duplicate_keys.contains(key));
+            if is_unchanged || duplicate_archived || duplicate_in_pass {
                 report.skipped_unchanged += 1;
             } else {
                 if let Some(existing) = existing.as_ref() {
+                    if source_id.is_none() {
+                        session.id = existing.id.clone();
+                    }
                     set_capture_revision(
                         &mut session,
                         metadata_u64(existing, "capture_revision").unwrap_or(1) + 1,
                     );
                 }
                 imports.push(session);
+                if let Some(duplicate_key) = duplicate_key {
+                    pending_duplicate_keys.insert(duplicate_key);
+                }
+                imported_from_candidate = true;
             }
         }
+        add_candidate_report(
+            &mut report,
+            &candidate,
+            if imported_from_candidate {
+                "imported"
+            } else {
+                "unchanged"
+            },
+            if imported_from_candidate {
+                None
+            } else {
+                Some("duplicate already archived".to_string())
+            },
+            pass,
+            observer,
+        );
         if let Some(file_state) = state.files.get_mut(&key) {
             file_state.captured_fingerprint = Some(fingerprint);
         }
@@ -352,7 +607,61 @@ pub fn run_with_roots(
         save_state(db_path, &state)?;
         remove_capture_inputs(db_path, &queued_records, legacy_journal_removable)?;
     }
+    observer(CaptureEvent::PassCompleted { pass });
     Ok(report)
+}
+
+fn add_candidate_report(
+    report: &mut CaptureReport,
+    candidate: &Candidate,
+    outcome: &str,
+    reason: Option<String>,
+    pass: u8,
+    observer: &mut dyn FnMut(CaptureEvent),
+) {
+    let path = candidate.path.to_string_lossy().into_owned();
+    report.candidates.push(CandidateReport {
+        platform: candidate.platform,
+        path: path.clone(),
+        outcome: outcome.to_string(),
+        reason: reason.clone(),
+    });
+    observer(CaptureEvent::Candidate {
+        pass,
+        platform: candidate.platform,
+        path,
+        outcome: outcome.to_string(),
+        reason,
+    });
+}
+
+fn merge_settled_reports(first: CaptureReport, mut second: CaptureReport) -> CaptureReport {
+    let mut candidates = first.candidates;
+    let mut paths = candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<HashSet<_>>();
+    for candidate in second.candidates.drain(..) {
+        if paths.insert(candidate.path.clone()) {
+            candidates.push(candidate);
+        } else if let Some(existing) = candidates
+            .iter_mut()
+            .find(|existing| existing.path == candidate.path)
+        {
+            *existing = candidate;
+        }
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    second.candidates = candidates;
+    second.discovered_files = second.candidates.len();
+    second.discovered_by_platform.clear();
+    for candidate in &second.candidates {
+        *second
+            .discovered_by_platform
+            .entry(candidate.platform.slug().to_string())
+            .or_default() += 1;
+    }
+    second
 }
 
 pub fn record_hook_hint(db_path: &Path, hint: HookHint) -> Result<()> {
@@ -508,13 +817,88 @@ pub fn parse_transcript(
 ) -> Result<Vec<ChatSessionV1>> {
     let file_fingerprint = fingerprint_bytes(bytes);
     let value = serde_json::from_slice::<Value>(bytes).ok();
-    let mut sessions = if let Some(value) = value {
+    let mut sessions = if platform == Platform::CopilotCli {
+        let copilot = parse_copilot_jsonl(path, bytes, &file_fingerprint)?;
+        if copilot.is_empty() {
+            if let Some(value) = value.as_ref() {
+                parse_document(platform, path, value, &file_fingerprint)?
+            } else {
+                parse_jsonl(platform, path, bytes, &file_fingerprint)?
+            }
+        } else {
+            copilot
+        }
+    } else if let Some(value) = value {
         parse_document(platform, path, &value, &file_fingerprint)?
     } else {
-        parse_jsonl(platform, path, bytes, &file_fingerprint)
+        parse_jsonl(platform, path, bytes, &file_fingerprint)?
     };
     sessions.retain(|s| !s.messages.is_empty());
+    let records_read = if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        value.as_array().map_or(1, Vec::len)
+    } else {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+            .count()
+    };
+    let malformed_records = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .filter(|line| serde_json::from_slice::<Value>(line).is_err())
+        .count();
+    let hidden_reasoning = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| {
+            let text = String::from_utf8_lossy(line).to_ascii_lowercase();
+            text.contains("reason") || text.contains("thinking") || text.contains("progress")
+        })
+        .count();
+    let visible_messages_extracted = sessions.iter().map(|s| s.messages.len()).sum::<usize>();
+    for session in &mut sessions {
+        update_capture_metrics(
+            session,
+            records_read,
+            visible_messages_extracted,
+            malformed_records,
+            hidden_reasoning,
+        );
+    }
     Ok(sessions)
+}
+
+fn update_capture_metrics(
+    session: &mut ChatSessionV1,
+    records_read: usize,
+    visible_messages_extracted: usize,
+    malformed_records: usize,
+    hidden_reasoning: usize,
+) {
+    let mut metadata = serde_json::from_str::<Value>(&session.metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert(
+        "records_read".into(),
+        Value::Number((records_read as u64).into()),
+    );
+    metadata.insert(
+        "visible_messages_extracted".into(),
+        Value::Number((visible_messages_extracted as u64).into()),
+    );
+    let mut skipped = Map::new();
+    if hidden_reasoning > 0 {
+        skipped.insert(
+            "opaque reasoning".into(),
+            Value::Number((hidden_reasoning as u64).into()),
+        );
+    }
+    metadata.insert("records_skipped_by_reason".into(), Value::Object(skipped));
+    metadata.insert(
+        "malformed_records".into(),
+        Value::Number((malformed_records as u64).into()),
+    );
+    session.metadata_json = Value::Object(metadata).to_string();
 }
 
 fn parse_document(
@@ -536,7 +920,7 @@ fn parse_document(
                             session,
                             platform,
                             path,
-                            &source_id,
+                            Some(&source_id),
                             file_fingerprint,
                         ));
                     }
@@ -557,7 +941,7 @@ fn parse_document(
             session,
             platform,
             path,
-            &source_id,
+            Some(&source_id),
             file_fingerprint,
         )]);
     }
@@ -573,17 +957,22 @@ fn parse_jsonl(
     path: &Path,
     bytes: &[u8],
     file_fingerprint: &str,
-) -> Vec<ChatSessionV1> {
+) -> Result<Vec<ChatSessionV1>> {
     let mut messages = Vec::new();
     let mut session_id = None;
     let mut model = None;
     let mut created_at = None;
+    let mut invalid_lines = 0;
     for line in bytes.split(|b| *b == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
+        let value = match serde_json::from_slice::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_lines += 1;
+                continue;
+            }
         };
         session_id = session_id.or_else(|| {
             find_string(
@@ -601,17 +990,200 @@ fn parse_jsonl(
         collect_message_records(&value, &mut messages);
     }
     if messages.is_empty() {
-        return Vec::new();
+        if invalid_lines > 0 {
+            return Err(anyhow!("malformed JSONL transcript"));
+        }
+        return Ok(Vec::new());
     }
-    let id = session_id.unwrap_or_else(|| {
+    let id = session_id.clone().unwrap_or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("session")
             .to_string()
     });
     let mut session = make_session(platform, path, &id, model, created_at, messages);
-    session = with_capture_metadata(session, platform, path, &id, file_fingerprint);
-    vec![session]
+    session = with_capture_metadata(
+        session,
+        platform,
+        path,
+        session_id.as_deref(),
+        file_fingerprint,
+    );
+    Ok(vec![session])
+}
+
+/// Copilot CLI writes an envelope whose visible payload is nested under
+/// `data`.  Keep this adapter deliberately narrow so metadata files and
+/// opaque reasoning events cannot become archive messages.
+fn parse_copilot_jsonl(
+    path: &Path,
+    bytes: &[u8],
+    file_fingerprint: &str,
+) -> Result<Vec<ChatSessionV1>> {
+    let mut messages = Vec::new();
+    let mut session_id = None;
+    let mut model = None;
+    let mut created_at = None;
+    let mut invalid_lines = 0;
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_lines += 1;
+                continue;
+            }
+        };
+        session_id = session_id.or_else(|| {
+            find_string(
+                &value,
+                &[
+                    "session_id",
+                    "sessionId",
+                    "conversation_id",
+                    "conversationId",
+                ],
+            )
+            .or_else(|| {
+                value.get("data").and_then(|data| {
+                    find_string(
+                        data,
+                        &[
+                            "session_id",
+                            "sessionId",
+                            "conversation_id",
+                            "conversationId",
+                        ],
+                    )
+                })
+            })
+        });
+        model = model.or_else(|| {
+            find_string(&value, &["model", "model_name", "modelName"]).or_else(|| {
+                value
+                    .get("data")
+                    .and_then(|data| find_string(data, &["model", "model_name", "modelName"]))
+            })
+        });
+        created_at = created_at.or_else(|| {
+            find_timestamp(&value).or_else(|| value.get("data").and_then(find_timestamp))
+        });
+
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if event_type.contains("reason")
+            || event_type.contains("thinking")
+            || event_type.contains("progress")
+        {
+            continue;
+        }
+        let role = if event_type.starts_with("user")
+            || (event_type.is_empty()
+                && value
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| normalize_role(role) == Some(MessageRole::User)))
+        {
+            Some(MessageRole::User)
+        } else if event_type.starts_with("assistant")
+            || event_type.starts_with("model")
+            || (event_type.is_empty()
+                && value
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| normalize_role(role) == Some(MessageRole::Model)))
+        {
+            Some(MessageRole::Model)
+        } else if event_type.starts_with("tool")
+            || (event_type.is_empty()
+                && value
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| normalize_role(role) == Some(MessageRole::Tool)))
+        {
+            Some(MessageRole::Tool)
+        } else {
+            None
+        };
+        let Some(role) = role else { continue };
+        let payload = value.get("data").unwrap_or(&value);
+        let mut content = payload
+            .get("content")
+            .or_else(|| payload.get("text"))
+            .or_else(|| payload.get("result"))
+            .map(extract_visible_text)
+            .unwrap_or_default();
+        if role == MessageRole::Tool
+            && content.trim().is_empty()
+            && let Some(name) = payload
+                .get("toolName")
+                .or_else(|| payload.get("name"))
+                .and_then(Value::as_str)
+        {
+            let args = payload
+                .get("arguments")
+                .or_else(|| payload.get("input"))
+                .map(extract_visible_text)
+                .unwrap_or_default();
+            let args = if args.is_empty() {
+                payload
+                    .get("arguments")
+                    .or_else(|| payload.get("input"))
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .unwrap_or_default()
+            } else {
+                args
+            };
+            content = if args.is_empty() {
+                format!("[tool: {name}]")
+            } else {
+                format!("[tool: {name}] {args}")
+            };
+        }
+        if content.trim().is_empty() {
+            continue;
+        }
+        messages.push(MessageV1 {
+            role,
+            content: content.trim().to_string(),
+            tool_calls: None,
+            tool_outputs: None,
+            id: find_string(payload, &["id", "message_id", "messageId"]),
+            parent_id: find_string(payload, &["parent_id", "parentId"]),
+            metadata_json: String::new(),
+        });
+    }
+    if messages.is_empty() {
+        if invalid_lines > 0 {
+            return Err(anyhow!("malformed JSONL transcript"));
+        }
+        return Ok(Vec::new());
+    }
+    let display_id = session_id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
+    let session = make_session(
+        Platform::CopilotCli,
+        path,
+        &display_id,
+        model,
+        created_at,
+        messages,
+    );
+    Ok(vec![with_capture_metadata(
+        session,
+        Platform::CopilotCli,
+        path,
+        session_id.as_deref(),
+        file_fingerprint,
+    )])
 }
 
 fn parse_value_as_session(
@@ -644,10 +1216,20 @@ fn parse_value_as_session(
                     .unwrap_or("session")
                     .to_string()
             });
+            let source_id = find_string(
+                value,
+                &[
+                    "session_id",
+                    "sessionId",
+                    "conversation_id",
+                    "conversationId",
+                ],
+            );
+            let display_id = source_id.clone().unwrap_or_else(|| id.clone());
             let session = make_session(
                 platform,
                 path,
-                &id,
+                &display_id,
                 find_string(value, &["model", "model_name", "modelName"]),
                 find_timestamp(value),
                 messages,
@@ -656,7 +1238,7 @@ fn parse_value_as_session(
                 session,
                 platform,
                 path,
-                &id,
+                source_id.as_deref(),
                 file_fingerprint,
             ));
         }
@@ -674,7 +1256,7 @@ fn make_session(
 ) -> ChatSessionV1 {
     let title = title_from_messages(&messages, platform);
     ChatSessionV1 {
-        id: stable_session_id(platform, source_id, path),
+        id: stable_session_id(platform, Some(source_id), path),
         title: Some(title),
         source: Some(platform.slug().to_string()),
         model,
@@ -688,10 +1270,11 @@ fn with_capture_metadata(
     mut session: ChatSessionV1,
     platform: Platform,
     path: &Path,
-    source_id: &str,
+    source_id: Option<&str>,
     file_fingerprint: &str,
 ) -> ChatSessionV1 {
     let session_fingerprint = fingerprint_for_session(&session);
+    let source_id = source_id.filter(|id| !id.is_empty() && *id != "unknown");
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "source_path".into(),
@@ -699,11 +1282,11 @@ fn with_capture_metadata(
     );
     metadata.insert(
         "platform_session_id".into(),
-        Value::String(source_id.to_string()),
+        Value::String(source_id.unwrap_or("unknown").to_string()),
     );
     metadata.insert(
         "content_fingerprint".into(),
-        Value::String(session_fingerprint),
+        Value::String(session_fingerprint.clone()),
     );
     metadata.insert(
         "file_fingerprint".into(),
@@ -711,8 +1294,30 @@ fn with_capture_metadata(
     );
     metadata.insert("last_seen_at".into(), Value::Number(now_secs().into()));
     metadata.insert("capture_revision".into(), Value::Number(1.into()));
+    metadata.insert("importer".into(), Value::String("capture".into()));
+    metadata.insert("parser_version".into(), Value::String("capture-v2".into()));
+    metadata.insert("ingest_time".into(), Value::Number(now_secs().into()));
+    metadata.insert(
+        "source_platform".into(),
+        Value::String(platform.slug().into()),
+    );
+    metadata.insert(
+        "source_session_id".into(),
+        Value::String(source_id.unwrap_or("unknown").into()),
+    );
+    if source_id.is_none() {
+        metadata.insert(
+            "duplicate_key".into(),
+            Value::String(canonical_duplicate_key(
+                platform.slug(),
+                &normalized_visible_message_fingerprint(&session),
+            )),
+        );
+    }
     session.metadata_json = Value::Object(metadata).to_string();
-    // Keep the stable source identity independent of a path's spelling.
+    // A platform session ID is the primary identity. Without one, retain a
+    // path-based ID so changed content can be stored as a new revision while
+    // duplicate content is suppressed separately via duplicate_key.
     session.id = stable_session_id(platform, source_id, path);
     session
 }
@@ -884,17 +1489,66 @@ fn title_from_messages(messages: &[MessageV1], platform: Platform) -> String {
         .to_string()
 }
 
-fn stable_session_id(platform: Platform, source_id: &str, path: &Path) -> String {
-    let identity = if source_id.is_empty() {
-        path.to_string_lossy().to_string()
-    } else {
-        source_id.to_string()
-    };
+fn stable_session_id(platform: Platform, source_id: Option<&str>, path: &Path) -> String {
+    let identity = source_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
     format!(
         "capture-{}-{:016x}",
         platform.slug(),
         fnv1a(identity.as_bytes())
     )
+}
+
+fn metadata_platform(session: &ChatSessionV1) -> String {
+    let metadata = serde_json::from_str::<Value>(&session.metadata_json).ok();
+    metadata
+        .as_ref()
+        .and_then(|value| value.get("source_platform"))
+        .and_then(Value::as_str)
+        .filter(|platform| !platform.is_empty() && *platform != "unknown")
+        .or(session.source.as_deref())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase()
+}
+
+fn canonical_duplicate_key(platform: &str, normalized_fingerprint: &str) -> String {
+    format!(
+        "capture-duplicate-{}-{:016x}",
+        platform,
+        fnv1a(normalized_fingerprint.as_bytes())
+    )
+}
+
+fn normalized_visible_message_fingerprint(session: &ChatSessionV1) -> String {
+    let mut normalized = String::new();
+    for message in &session.messages {
+        normalized.push_str(&format!("{:?}:", message.role));
+        normalized.push_str(
+            &message
+                .content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        normalized.push('\n');
+    }
+    format!("{:016x}", fnv1a(normalized.as_bytes()))
+}
+
+fn session_duplicate_key(session: &ChatSessionV1) -> Option<String> {
+    let platform_session_id = metadata_value(session, "platform_session_id");
+    if platform_session_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty() && id != "unknown")
+    {
+        return None;
+    }
+    Some(canonical_duplicate_key(
+        &metadata_platform(session),
+        &normalized_visible_message_fingerprint(session),
+    ))
 }
 
 pub fn fingerprint_for_session(session: &ChatSessionV1) -> String {
@@ -1043,14 +1697,14 @@ fn allowed_transcript_path(platform: Platform, root: &Path, path: &Path) -> bool
         Platform::Codex => extension == Some("jsonl") && file_name.starts_with("rollout-"),
         Platform::ClaudeCode => matches!(extension, Some("jsonl" | "ndjson")),
         Platform::CopilotCli => {
-            matches!(extension, Some("json" | "jsonl" | "ndjson"))
-                && (components.iter().any(|component| {
-                    matches!(*component, "session-state" | "sessions" | "transcripts")
-                }) || matches!(
-                    root.file_name().and_then(|name| name.to_str()),
-                    Some("session-state" | "sessions")
-                ))
-                && !file_name.eq_ignore_ascii_case("settings.json")
+            matches!(extension, Some("json" | "jsonl"))
+                && (file_name.eq_ignore_ascii_case("events.jsonl")
+                    // Legacy Copilot session snapshots are retained for
+                    // backwards-compatible discovery; metadata artifacts are
+                    // still excluded.
+                    || file_name.eq_ignore_ascii_case("session.json"))
+                && (components.contains(&"session-state")
+                    || root.file_name().and_then(|name| name.to_str()) == Some("session-state"))
         }
         Platform::Cursor => {
             matches!(extension, Some("json" | "jsonl" | "ndjson"))
@@ -2105,6 +2759,34 @@ mod tests {
     }
 
     #[test]
+    fn copilot_events_extract_nested_visible_turns_and_tool_context() {
+        let path = Path::new("events.jsonl");
+        let input = br#"{"type":"user.message","data":{"sessionId":"nested-1","timestamp":1700000000,"content":"hello"}}
+{"type":"assistant.reasoning","data":{"content":"do not persist"}}
+{"type":"assistant.message","data":{"sessionId":"nested-1","model":"copilot-x","content":"hi"}}
+{"type":"tool.execution_start","data":{"sessionId":"nested-1","toolName":"shell","arguments":{"command":"pwd"}}}
+"#;
+        let sessions = parse_transcript(Platform::CopilotCli, path, input).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0]
+                .messages
+                .iter()
+                .map(|message| (&message.role, message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (&MessageRole::User, "hello"),
+                (&MessageRole::Model, "hi"),
+                (&MessageRole::Tool, "[tool: shell] {\"command\":\"pwd\"}"),
+            ]
+        );
+        assert_eq!(
+            metadata_value(&sessions[0], "source_session_id").as_deref(),
+            Some("nested-1")
+        );
+    }
+
+    #[test]
     fn malformed_and_partial_jsonl_keep_valid_records() {
         let input = br#"not json
 {"type":"user","sessionId":"partial","content":"keep this"}
@@ -2395,6 +3077,35 @@ mod tests {
         assert!(!queue.exists());
         let second = run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
         assert_eq!(second.imported_sessions, 0);
+    }
+
+    #[test]
+    fn duplicate_hook_delivery_does_not_duplicate_a_capture() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("db");
+        let file = dir.path().join("session.json");
+        fs::write(
+            &file,
+            json!({
+                "session_id": "duplicate-hook",
+                "messages": [{"role": "user", "content": "one hook"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hint = HookHint {
+            platform: Platform::Generic,
+            session_id: Some("duplicate-hook".into()),
+            path: Some(file.to_string_lossy().into()),
+            seen_at: 1,
+        };
+        record_hook_hint(&db, hint.clone()).unwrap();
+        record_hook_hint(&db, hint).unwrap();
+
+        let report = run_with_roots(&db, &CaptureOptions::default(), &[]).unwrap();
+        assert_eq!(report.imported_sessions, 1);
+        assert!(load_state(&db).unwrap().pending_hooks.is_empty());
+        assert_eq!(Storage::new(db).scan_all().unwrap().len(), 1);
     }
 
     #[test]
