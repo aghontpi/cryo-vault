@@ -616,101 +616,76 @@ impl Storage {
         before: Option<u64>,
     ) -> Result<Vec<ChatSessionV1>> {
         trace!(query, ?after, ?before, "Starting search");
-
-        let mut results = Vec::new();
-        let mut pending_ids = std::collections::HashSet::new();
         let query_lower = query.to_lowercase();
-
-        // 1. Search Pending Buffer First
-        if let Ok(pending_sessions) = self.get_pending_sessions() {
-            for s in pending_sessions {
-                if let Some(after_ts) = after
-                    && let Some(ct) = s.created_at
-                    && ct < after_ts
-                {
-                    continue;
-                }
-                if let Some(before_ts) = before
-                    && let Some(ct) = s.created_at
-                    && ct > before_ts
-                {
-                    continue;
-                }
-
-                let mut found = false;
-                for msg in &s.messages {
-                    if msg.content.to_lowercase().contains(&query_lower) {
-                        found = true;
-                        break;
-                    }
-                }
-                if found {
-                    pending_ids.insert(s.id.clone());
-                    results.push(s);
-                }
-            }
-        }
-
-        // 2. Search every archived segment (oldest → newest). Previously this
-        //    only looked at the latest segment, so after a 1 GB rotation older
-        //    data became invisible to search.
+        let pending_sessions = self.get_pending_sessions().unwrap_or_default();
+        let pending_ids = pending_sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<std::collections::HashSet<_>>();
         let segments = self.list_segments();
         if segments.is_empty() {
-            return Ok(results);
+            return Ok(pending_sessions
+                .into_iter()
+                .filter(|session| session_matches(session, &query_lower, after, before))
+                .collect());
         }
 
-        for (path, index_path, _seg) in segments {
-            if !path.exists() {
-                continue;
-            }
+        // Index entries are append-only. Resolve each ID to its newest block
+        // before reading data, so an old revision that passes the Bloom filter
+        // can be skipped without decompression.
+        let mut indexes_by_segment = HashMap::new();
+        let mut latest_locations = HashMap::new();
+        for (_path, index_path, segment) in &segments {
             if !index_path.exists() {
                 return Err(anyhow::anyhow!(
                     "Index file not found for segment {}. Please run: cryo reindex",
-                    path.display()
+                    index_path.display()
                 ));
             }
+            let mut idx_file = File::open(index_path)?;
+            let mut indexes = Vec::new();
+            loop {
+                let mut size_buf = [0u8; 4];
+                let n = idx_file.read(&mut size_buf)?;
+                if n == 0 {
+                    break;
+                }
+                if n < 4 {
+                    idx_file.read_exact(&mut size_buf[n..])?;
+                }
+                let size = u32::from_le_bytes(size_buf) as usize;
+                let mut compressed = vec![0u8; size];
+                idx_file.read_exact(&mut compressed)?;
+                let raw = zstd::decode_all(&compressed[..])?;
+                let index: crate::index::BlockIndex = bincode::deserialize(&raw)?;
+                for session_id in index.session_id.split(',') {
+                    latest_locations.insert(session_id.to_string(), (*segment, index.data_offset));
+                }
+                indexes.push(index);
+            }
+            indexes_by_segment.insert(*segment, indexes);
+        }
 
+        let mut result_by_id = HashMap::new();
+        let mut result_order = Vec::new();
+        for (path, _index_path, segment) in segments {
+            if !path.exists() {
+                continue;
+            }
+            let indexes = indexes_by_segment
+                .get(&segment)
+                .cloned()
+                .unwrap_or_default();
             let mut file = File::open(&path)?;
-            let mut idx_file = File::open(&index_path)?;
-
             let mut magic_buf = [0u8; 8];
             file.read_exact(&mut magic_buf)?;
             if magic_buf != DATA_MAGIC {
                 return Err(anyhow::anyhow!("Invalid file format in {}", path.display()));
             }
 
-            // Walk the data file sequentially. When an index entry is
-            // available we use it for fast bloom-filter / time-range pruning.
-            // When the index runs out before the data does — a known shape of
-            // index corruption from older releases where MCP `add_log` and
-            // CLI `add` raced without a shared lock — we fall back to
-            // decompressing each unindexed block and content-checking it
-            // directly. This keeps search correct (no missing matches) at a
-            // proportional speed cost on the unindexed tail.
-            let mut idx_exhausted = false;
-            let mut unindexed_blocks_scanned: u64 = 0;
-
+            let mut block_number = 0usize;
+            let mut unindexed_blocks_scanned = 0u64;
             loop {
-                let index_opt: Option<crate::index::BlockIndex> = if idx_exhausted {
-                    None
-                } else {
-                    let mut idx_size_buf = [0u8; 4];
-                    let n = idx_file.read(&mut idx_size_buf)?;
-                    if n == 0 {
-                        idx_exhausted = true;
-                        None
-                    } else {
-                        if n < 4 {
-                            idx_file.read_exact(&mut idx_size_buf[n..])?;
-                        }
-                        let idx_size = u32::from_le_bytes(idx_size_buf) as usize;
-                        let mut compressed_idx_buf = vec![0u8; idx_size];
-                        idx_file.read_exact(&mut compressed_idx_buf)?;
-                        let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
-                        Some(bincode::deserialize(&idx_buf)?)
-                    }
-                };
-
                 let mut size_buf = [0u8; 4];
                 let n = file.read(&mut size_buf)?;
                 if n == 0 {
@@ -720,91 +695,60 @@ impl Storage {
                     file.read_exact(&mut size_buf[n..])?;
                 }
                 let size = u32::from_le_bytes(size_buf) as usize;
+                let index = indexes.get(block_number);
+                block_number += 1;
 
-                if index_opt.is_none() {
+                if let Some(index) = index {
+                    let has_visible_revision = index
+                        .session_id
+                        .split(',')
+                        .any(|id| latest_locations.get(id) == Some(&(segment, index.data_offset)));
+                    if !has_visible_revision
+                        || after.is_some_and(|ts| index.max_time < ts)
+                        || before.is_some_and(|ts| index.min_time > ts)
+                        || !index.matches(query)
+                    {
+                        file.seek(io::SeekFrom::Current(size as i64))?;
+                        continue;
+                    }
+                } else {
                     unindexed_blocks_scanned += 1;
                 }
 
-                // Time-range prefilter via index (only when block-level
-                // bounds are known — without an index we have to decompress
-                // and do the per-session check below).
-                if let Some(ref idx) = index_opt {
-                    if let Some(after_ts) = after
-                        && idx.max_time < after_ts
-                    {
-                        file.seek(io::SeekFrom::Current(size as i64))?;
-                        continue;
-                    }
-                    if let Some(before_ts) = before
-                        && idx.min_time > before_ts
-                    {
-                        file.seek(io::SeekFrom::Current(size as i64))?;
-                        continue;
-                    }
-                }
-
-                // Bloom-filter prefilter when an index entry is present.
-                // No index entry → can't prune, fall through to decompress.
-                let must_decompress = match index_opt.as_ref() {
-                    Some(idx) => idx.matches(query),
-                    None => true,
-                };
-
-                if !must_decompress {
-                    file.seek(std::io::SeekFrom::Current(size as i64))?;
-                    continue;
-                }
-
-                let mut compressed_buf = vec![0u8; size];
-                file.read_exact(&mut compressed_buf)?;
-
-                let raw_bytes = zstd::decode_all(&compressed_buf[..])?;
-                let wrapper: StoredSession = bincode::deserialize(&raw_bytes)?;
-
+                let mut compressed = vec![0u8; size];
+                file.read_exact(&mut compressed)?;
+                let raw = zstd::decode_all(&compressed[..])?;
+                let wrapper: StoredSession = bincode::deserialize(&raw)?;
                 let sessions = match wrapper {
-                    StoredSession::V1(s) => vec![s],
+                    StoredSession::V1(session) => vec![session],
                     StoredSession::Block(sessions) => sessions,
                     StoredSession::V2(block) => block.sessions,
                 };
-                for s in sessions {
-                    // Per-session time filter — block-level min/max can let
-                    // sessions outside the requested range slip through when a
-                    // block straddles the boundary or contains sessions with
-                    // no `created_at`.
-                    if let Some(after_ts) = after
-                        && let Some(ct) = s.created_at
-                        && ct < after_ts
-                    {
+                let mut block_sessions = HashMap::new();
+                for session in sessions {
+                    let visible = index.is_some_and(|index| {
+                        latest_locations
+                            .get(&session.id)
+                            .is_some_and(|location| *location == (segment, index.data_offset))
+                    }) || index.is_none();
+                    if visible {
+                        block_sessions.insert(session.id.clone(), session);
+                    }
+                }
+                for (id, session) in block_sessions {
+                    if pending_ids.contains(&id) {
                         continue;
                     }
-                    if let Some(before_ts) = before
-                        && let Some(ct) = s.created_at
-                        && ct > before_ts
-                    {
-                        continue;
-                    }
-
-                    let mut found = false;
-                    for msg in &s.messages {
-                        if msg.content.to_lowercase().contains(&query_lower) {
-                            found = true;
-                            break;
+                    if session_matches(&session, &query_lower, after, before) {
+                        if !result_by_id.contains_key(&id) {
+                            result_order.push(id.clone());
                         }
-                    }
-                    if found && !pending_ids.contains(&s.id) {
-                        if let Some(existing) =
-                            results.iter_mut().find(|existing| existing.id == s.id)
-                        {
-                            // A resumed session is appended as a new revision;
-                            // the newest visible content wins.
-                            *existing = s;
-                        } else {
-                            results.push(s);
-                        }
+                        result_by_id.insert(id, session);
+                    } else {
+                        result_by_id.remove(&id);
                     }
                 }
             }
-
             if unindexed_blocks_scanned > 0 {
                 tracing::warn!(
                     segment = %path.display(),
@@ -815,26 +759,23 @@ impl Storage {
             }
         }
 
-        // Search indexes are append-only, so a resumed session may leave an
-        // older revision whose Bloom filter still matches the query. Rebuild
-        // the logical result set from `scan_all`, which resolves revisions in
-        // insertion order and guarantees latest-write-wins semantics.
-        let visible = self.scan_all()?;
-        let visible_matches = visible
-            .into_iter()
-            .filter(|session| {
-                after.is_none_or(|ts| session.created_at.is_none_or(|created| created >= ts))
-                    && before
-                        .is_none_or(|ts| session.created_at.is_none_or(|created| created <= ts))
-                    && session
-                        .messages
-                        .iter()
-                        .any(|message| message.content.to_lowercase().contains(&query_lower))
-            })
-            .collect::<Vec<_>>();
+        for session in pending_sessions {
+            let id = session.id.clone();
+            result_by_id.remove(&id);
+            if session_matches(&session, &query_lower, after, before) {
+                if !result_by_id.contains_key(&id) {
+                    result_order.push(id.clone());
+                }
+                result_by_id.insert(id, session);
+            }
+        }
 
-        debug!(results_count = visible_matches.len(), "Search completed");
-        Ok(visible_matches)
+        let results = result_order
+            .into_iter()
+            .filter_map(|id| result_by_id.remove(&id))
+            .collect::<Vec<_>>();
+        debug!(results_count = results.len(), "Search completed");
+        Ok(results)
     }
 
     /// Reads all sessions from every segment on disk (oldest → newest)
@@ -1503,13 +1444,27 @@ impl Storage {
     }
 }
 
+fn session_matches(
+    session: &ChatSessionV1,
+    query_lower: &str,
+    after: Option<u64>,
+    before: Option<u64>,
+) -> bool {
+    after.is_none_or(|ts| session.created_at.is_none_or(|created| created >= ts))
+        && before.is_none_or(|ts| session.created_at.is_none_or(|created| created <= ts))
+        && session
+            .messages
+            .iter()
+            .any(|message| message.content.to_lowercase().contains(query_lower))
+}
+
 fn sessions_equivalent(left: &ChatSessionV1, right: &ChatSessionV1) -> bool {
     left.id == right.id
         && left.title == right.title
         && left.source == right.source
         && left.model == right.model
         && left.created_at == right.created_at
-        && left.metadata_json == right.metadata_json
+        && semantic_metadata(&left.metadata_json) == semantic_metadata(&right.metadata_json)
         && left.messages.len() == right.messages.len()
         && left.messages.iter().zip(&right.messages).all(|(a, b)| {
             a.role == b.role
@@ -1517,10 +1472,36 @@ fn sessions_equivalent(left: &ChatSessionV1, right: &ChatSessionV1) -> bool {
                 && a.id == b.id
                 && a.parent_id == b.parent_id
                 && a.metadata_json == b.metadata_json
-                && a.tool_calls.as_ref().map(|v| v.len()) == b.tool_calls.as_ref().map(|v| v.len())
-                && a.tool_outputs.as_ref().map(|v| v.len())
-                    == b.tool_outputs.as_ref().map(|v| v.len())
+                && a.tool_calls == b.tool_calls
+                && a.tool_outputs == b.tool_outputs
         })
+}
+
+fn semantic_metadata(metadata_json: &str) -> serde_json::Value {
+    let mut metadata = serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    for key in [
+        "ingest_time",
+        "importer",
+        "parser_version",
+        "source_platform",
+        "source_path",
+        "source_session_id",
+        "records_read",
+        "visible_messages_extracted",
+        "records_skipped_by_reason",
+        "malformed_records",
+        "file_fingerprint",
+        "content_fingerprint",
+        "capture_revision",
+        "last_seen_at",
+        "duplicate_key",
+    ] {
+        metadata.remove(key);
+    }
+    serde_json::Value::Object(metadata)
 }
 
 fn ensure_ingestion_metadata(session: &mut ChatSessionV1, importer: &str) {

@@ -274,6 +274,33 @@ fn test_idempotency() {
 }
 
 #[test]
+fn test_non_empty_stream_replay_is_idempotent_and_compares_tool_values() {
+    let (storage, _temp) = create_test_storage();
+    let mut session = create_dummy_session("stream-replay", 1);
+    session.messages[0].tool_calls = Some(vec![crate::schema::ToolCall {
+        name: "read_file".into(),
+        arguments: r#"{"path":"README.md"}"#.into(),
+        id: Some("call-1".into()),
+    }]);
+    session.messages[0].tool_outputs = Some(vec![crate::schema::ToolOutput {
+        tool_call_id: Some("call-1".into()),
+        content: "contents".into(),
+    }]);
+
+    storage.append_pending(session.clone()).unwrap();
+    assert_eq!(storage.flush_pending().unwrap(), 1);
+
+    storage.append_pending(session.clone()).unwrap();
+    assert_eq!(storage.flush_pending().unwrap(), 0);
+
+    let mut changed = session;
+    changed.messages[0].tool_calls.as_mut().unwrap()[0].arguments =
+        r#"{"path":"different.md"}"#.into();
+    storage.append_pending(changed).unwrap();
+    assert_eq!(storage.flush_pending().unwrap(), 1);
+}
+
+#[test]
 fn test_pending_new_revision_replaces_archived_revision() {
     let (storage, _temp) = create_test_storage();
     storage

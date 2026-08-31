@@ -46,7 +46,7 @@ impl<'a> BlockIndexParams<'a> {
 }
 
 /// Represents the index for a single compressed block (session)
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BlockIndex {
     pub session_id: String,
     /// Byte offset in data file
