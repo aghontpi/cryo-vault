@@ -70,6 +70,32 @@ fn test_append_and_read_session() {
 }
 
 #[test]
+fn test_session_ids_with_commas_survive_index_lookup_and_reindex() {
+    let (storage, _temp) = create_test_storage();
+    let session = create_dummy_session("project,session-1", 1);
+
+    storage.append_session(session.clone()).unwrap();
+    assert_eq!(
+        storage
+            .get_session_by_id("project,session-1")
+            .unwrap()
+            .unwrap()
+            .id,
+        session.id
+    );
+
+    storage.reindex().unwrap();
+    assert_eq!(
+        storage
+            .get_session_by_id("project,session-1")
+            .unwrap()
+            .unwrap()
+            .id,
+        session.id
+    );
+}
+
+#[test]
 fn test_latest_revision_wins_across_read_paths() {
     let (storage, _temp) = create_test_storage();
     let mut first = create_dummy_session("resumed", 1);

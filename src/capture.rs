@@ -344,9 +344,9 @@ fn run_once(
             .or_default() += 1;
     }
     let storage = Storage::new(db_path.to_path_buf());
-    let archived_duplicate_keys = load_duplicate_keys(db_path)?;
+    let mut duplicate_owners = load_duplicate_owners(db_path)?;
     let mut imports = Vec::new();
-    let mut pending_duplicate_keys = HashSet::new();
+    let mut duplicate_state_changed = false;
     let mut resolved_hint_paths = HashSet::new();
     let mut resolved_session_ids = HashSet::new();
 
@@ -514,16 +514,13 @@ fn run_once(
         }
 
         let mut imported_from_candidate = false;
-        for mut session in sessions {
+        for (session_index, mut session) in sessions.into_iter().enumerate() {
             if let Some(source_id) = metadata_value(&session, "platform_session_id") {
                 resolved_session_ids.insert(source_id);
             }
             let source_id = metadata_value(&session, "platform_session_id")
                 .filter(|id| !id.is_empty() && id != "unknown");
-            let existing = match storage.get_session_by_id(&session.id)? {
-                Some(existing) => Some(existing),
-                None => None,
-            };
+            let existing = storage.get_session_by_id(&session.id)?;
             let session_fingerprint = fingerprint_for_session(&session);
             let is_unchanged = existing
                 .as_ref()
@@ -537,11 +534,8 @@ fn run_once(
             });
             let duplicate_archived = duplicate_key
                 .as_ref()
-                .is_some_and(|key| archived_duplicate_keys.contains(key));
-            let duplicate_in_pass = duplicate_key
-                .as_ref()
-                .is_some_and(|key| pending_duplicate_keys.contains(key));
-            if is_unchanged || duplicate_archived || duplicate_in_pass {
+                .is_some_and(|key| duplicate_owners.values().any(|archived| archived == key));
+            if is_unchanged || duplicate_archived {
                 report.skipped_unchanged += 1;
             } else {
                 if let Some(existing) = existing.as_ref() {
@@ -555,7 +549,11 @@ fn run_once(
                 }
                 imports.push(session);
                 if let Some(duplicate_key) = duplicate_key {
-                    pending_duplicate_keys.insert(duplicate_key);
+                    duplicate_owners.insert(
+                        duplicate_owner_key(&candidate, session_index),
+                        duplicate_key,
+                    );
+                    duplicate_state_changed = true;
                 }
                 imported_from_candidate = true;
             }
@@ -576,23 +574,22 @@ fn run_once(
             pass,
             observer,
         );
-        if let Some(file_state) = state.files.get_mut(&key) {
+        if imported_from_candidate && let Some(file_state) = state.files.get_mut(&key) {
             file_state.captured_fingerprint = Some(fingerprint);
         }
     }
 
+    let import_count = imports.len();
     if !options.dry_run && !imports.is_empty() {
         report.imported_sessions = storage.append_bulk(imports)?;
-        if !pending_duplicate_keys.is_empty() {
-            let mut duplicate_keys = archived_duplicate_keys;
-            duplicate_keys.extend(pending_duplicate_keys);
-            save_duplicate_keys(db_path, &duplicate_keys)?;
-        }
+    }
+    if !options.dry_run && duplicate_state_changed {
+        save_duplicate_owners(db_path, &duplicate_owners)?;
     } else if options.dry_run {
         // Count parsed, deduplicated sessions rather than candidate files.
         // One transcript can contain multiple sessions, and malformed or
         // unsupported stable files must not be reported as imported.
-        report.imported_sessions = imports.len();
+        report.imported_sessions = import_count;
     }
 
     state.last_run_at = Some(now);
@@ -802,20 +799,36 @@ fn save_state(db_path: &Path, state: &CaptureState) -> Result<()> {
     Ok(())
 }
 
-fn load_duplicate_keys(db_path: &Path) -> Result<HashSet<String>> {
-    let path = db_path.join(DUPLICATE_FILE);
-    if !path.exists() {
-        return Ok(HashSet::new());
-    }
-    let bytes = fs::read(path).context("failed to read capture duplicate keys")?;
-    Ok(serde_json::from_slice(&bytes).context("failed to decode capture duplicate keys")?)
+fn duplicate_owner_key(candidate: &Candidate, session_index: usize) -> String {
+    format!(
+        "{}:{}#{session_index}",
+        candidate.platform.slug(),
+        candidate.path.to_string_lossy()
+    )
 }
 
-fn save_duplicate_keys(db_path: &Path, keys: &HashSet<String>) -> Result<()> {
+fn load_duplicate_owners(db_path: &Path) -> Result<HashMap<String, String>> {
+    let path = db_path.join(DUPLICATE_FILE);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let bytes = fs::read(path).context("failed to read capture duplicate keys")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).context("failed to decode capture duplicate keys")?;
+    if value.is_array() {
+        // The old format was an append-only array. It cannot identify which
+        // logical source currently owns a key, so discard it during migration
+        // rather than retaining stale suppression forever.
+        return Ok(HashMap::new());
+    }
+    serde_json::from_value(value).context("failed to decode capture duplicate owners")
+}
+
+fn save_duplicate_owners(db_path: &Path, owners: &HashMap<String, String>) -> Result<()> {
     fs::create_dir_all(db_path)?;
     let path = db_path.join(DUPLICATE_FILE);
     let temp = db_path.join("capture-duplicate-keys.json.tmp");
-    fs::write(&temp, serde_json::to_vec(keys)?)?;
+    fs::write(&temp, serde_json::to_vec(owners)?)?;
     fs::rename(temp, path)?;
     Ok(())
 }
@@ -836,7 +849,9 @@ pub fn parse_transcript(
 ) -> Result<Vec<ChatSessionV1>> {
     let file_fingerprint = fingerprint_bytes(bytes);
     let value = serde_json::from_slice::<Value>(bytes).ok();
-    let mut sessions = if platform == Platform::GeminiCli {
+    let mut sessions = if platform == Platform::Codex {
+        parse_codex_jsonl(path, bytes, &file_fingerprint)?
+    } else if platform == Platform::GeminiCli {
         parse_gemini_transcript(path, bytes, &file_fingerprint)?
     } else if platform == Platform::CopilotCli {
         let copilot = parse_copilot_jsonl(path, bytes, &file_fingerprint)?;
@@ -1065,12 +1080,138 @@ fn parse_jsonl(
     Ok(vec![session])
 }
 
+/// Parse Codex rollouts using the canonical response-item history. Codex can
+/// also emit legacy `event_msg.user_message` records that mirror the same
+/// user input; importing both would create duplicate user turns.
+fn parse_codex_jsonl(
+    path: &Path,
+    bytes: &[u8],
+    file_fingerprint: &str,
+) -> Result<Vec<ChatSessionV1>> {
+    let mut records = Vec::new();
+    let mut invalid_lines = 0;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => records.push(value),
+            Err(_) => invalid_lines += 1,
+        }
+    }
+
+    let has_canonical_messages = records.iter().any(|value| {
+        value.get("type").and_then(Value::as_str) == Some("response_item")
+            && value
+                .get("payload")
+                .and_then(Value::as_object)
+                .is_some_and(|payload| {
+                    payload.get("type").and_then(Value::as_str) == Some("message")
+                        && payload
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .and_then(normalize_role)
+                            .is_some_and(|role| role != MessageRole::Thought)
+                })
+    });
+
+    let mut messages = Vec::new();
+    let mut session_id = None;
+    let mut model = None;
+    let mut created_at = None;
+    for value in records {
+        let is_session_meta = value.get("type").and_then(Value::as_str) == Some("session_meta");
+        session_id = session_id.or_else(|| {
+            find_string(
+                &value,
+                &[
+                    "session_id",
+                    "sessionId",
+                    "conversation_id",
+                    "conversationId",
+                ],
+            )
+            .or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(|payload| {
+                        find_string(
+                            payload,
+                            &[
+                                "session_id",
+                                "sessionId",
+                                "conversation_id",
+                                "conversationId",
+                                "id",
+                            ],
+                        )
+                    })
+            })
+        });
+        model = model.or_else(|| {
+            find_string(&value, &["model", "model_name", "modelName"]).or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(|payload| find_string(payload, &["model", "model_name", "modelName"]))
+            })
+        });
+        created_at = created_at.or_else(|| {
+            find_timestamp(&value).or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(find_timestamp)
+            })
+        });
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => {
+                if let Some(payload) = value.get("payload") {
+                    collect_message_records(payload, &mut messages);
+                }
+            }
+            Some("event_msg")
+                if has_canonical_messages
+                    && value
+                        .get("payload")
+                        .and_then(|payload| payload.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("user_message") => {}
+            _ => collect_message_records(&value, &mut messages),
+        }
+    }
+
+    if messages.is_empty() {
+        if invalid_lines > 0 {
+            return Err(anyhow!("malformed JSONL transcript"));
+        }
+        return Ok(Vec::new());
+    }
+    let id = session_id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
+    let session = make_session(Platform::Codex, path, &id, model, created_at, messages);
+    Ok(vec![with_capture_metadata(
+        session,
+        Platform::Codex,
+        path,
+        session_id.as_deref(),
+        file_fingerprint,
+    )])
+}
+
 /// Parse Gemini CLI recordings without treating control records as messages.
 ///
 /// Modern Gemini sessions are JSONL streams whose records are either session
 /// metadata, visible `user`/`gemini` messages, or state changes. `$rewindTo`
-/// retains the record at the supplied message ID and drops everything after
-/// it. `$set.messages` is a checkpoint and replaces the current message set.
+/// removes the record at the supplied message ID and everything after it.
+/// If the target is absent, the current message set is cleared. `$set.messages`
+/// is a checkpoint and replaces the current message set.
 /// Legacy `session-*.json` files contain the same metadata and messages in one
 /// JSON object and are handled by the same state machine.
 fn parse_gemini_transcript(
@@ -1169,7 +1310,9 @@ fn apply_gemini_record(
             .iter()
             .position(|message| message.get("id").and_then(Value::as_str) == Some(rewind_to))
         {
-            messages.truncate(index + 1);
+            messages.truncate(index);
+        } else {
+            messages.clear();
         }
         return;
     }
@@ -1187,12 +1330,11 @@ fn apply_gemini_record(
         if let Some(existing) = messages
             .iter_mut()
             .find(|message| message.get("id").and_then(Value::as_str) == Some(id))
+            && let Some(existing) = existing.as_object_mut()
         {
-            if let (Some(existing), Some(update)) = (existing.as_object_mut(), Some(object)) {
-                for (key, value) in update {
-                    if key != "type" {
-                        existing.insert(key.clone(), value.clone());
-                    }
+            for (key, value) in object {
+                if key != "type" {
+                    existing.insert(key.clone(), value.clone());
                 }
             }
         }
@@ -1830,13 +1972,26 @@ fn canonical_duplicate_key(platform: &str, normalized_fingerprint: &str) -> Stri
 fn normalized_visible_message_fingerprint(session: &ChatSessionV1) -> String {
     let mut normalized = String::new();
     for message in &session.messages {
-        normalized.push_str(&format!("{:?}:", message.role));
-        normalized.push_str(
-            &message
-                .content
-                .split_whitespace()
+        let content = message
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tool_calls = message.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .map(|call| (&call.name, &call.arguments))
                 .collect::<Vec<_>>()
-                .join(" "),
+        });
+        let tool_outputs = message.tool_outputs.as_ref().map(|outputs| {
+            outputs
+                .iter()
+                .map(|output| &output.content)
+                .collect::<Vec<_>>()
+        });
+        normalized.push_str(
+            &serde_json::to_string(&(&message.role, content, tool_calls, tool_outputs))
+                .unwrap_or_default(),
         );
         normalized.push('\n');
     }
@@ -1846,7 +2001,16 @@ fn normalized_visible_message_fingerprint(session: &ChatSessionV1) -> String {
 pub fn fingerprint_for_session(session: &ChatSessionV1) -> String {
     let mut bytes = Vec::new();
     for message in &session.messages {
-        bytes.extend_from_slice(format!("{:?}:{}\n", message.role, message.content).as_bytes());
+        let semantic_message = (
+            &message.role,
+            &message.content,
+            &message.tool_calls,
+            &message.tool_outputs,
+            &message.id,
+            &message.parent_id,
+        );
+        bytes.extend_from_slice(&serde_json::to_vec(&semantic_message).unwrap_or_default());
+        bytes.push(b'\n');
     }
     format!("{:016x}", fnv1a(&bytes))
 }
@@ -3035,7 +3199,31 @@ mod tests {
             let input = fs::read(&path).unwrap();
             let sessions = parse_transcript(platform, &path, &input).unwrap();
             assert_eq!(sessions.len(), 1, "{platform}");
-            assert_eq!(sessions[0].messages.len(), 3, "{platform}");
+            let expected_messages = if platform == Platform::Codex { 2 } else { 3 };
+            assert_eq!(sessions[0].messages.len(), expected_messages, "{platform}");
+            if platform == Platform::Codex {
+                assert_eq!(
+                    sessions[0]
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == MessageRole::User)
+                        .count(),
+                    1
+                );
+                let archive_dir = TempDir::new().unwrap();
+                let storage = Storage::new(archive_dir.path().to_path_buf());
+                storage.append_session(sessions[0].clone()).unwrap();
+                let archived = storage.scan_all().unwrap();
+                assert_eq!(archived[0].messages.len(), 2);
+                assert_eq!(
+                    archived[0]
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == MessageRole::User)
+                        .count(),
+                    1
+                );
+            }
             assert_eq!(
                 metadata_value(&sessions[0], "platform_session_id").as_deref(),
                 Some(source_id)
@@ -3075,6 +3263,34 @@ mod tests {
             metadata_value(&sessions[0], "platform_session_id").as_deref(),
             Some("modern-gemini")
         );
+    }
+
+    #[test]
+    fn gemini_rewind_removes_target_and_following_messages() {
+        let input = br#"{"type":"session_metadata","sessionId":"rewind-gemini"}
+{"id":"u1","type":"user","content":"first prompt"}
+{"id":"g1","type":"gemini","content":"first answer"}
+{"id":"u2","type":"user","content":"rewound prompt"}
+{"id":"g2","type":"gemini","content":"rewound answer"}
+{"$rewindTo":"u2"}
+"#;
+        let sessions =
+            parse_transcript(Platform::GeminiCli, Path::new("session.jsonl"), input).unwrap();
+        assert_eq!(sessions[0].messages.len(), 2);
+        assert_eq!(sessions[0].messages[0].content, "first prompt");
+        assert_eq!(sessions[0].messages[1].content, "first answer");
+    }
+
+    #[test]
+    fn gemini_rewind_to_missing_message_clears_history() {
+        let input = br#"{"type":"session_metadata","sessionId":"missing-rewind"}
+{"id":"u1","type":"user","content":"first prompt"}
+{"id":"g1","type":"gemini","content":"first answer"}
+{"$rewindTo":"does-not-exist"}
+"#;
+        let sessions =
+            parse_transcript(Platform::GeminiCli, Path::new("session.jsonl"), input).unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[test]
@@ -3130,6 +3346,35 @@ mod tests {
         let sessions =
             parse_transcript(Platform::Codex, Path::new("partial.jsonl"), input).unwrap();
         assert_eq!(sessions[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn session_fingerprint_changes_when_tool_values_change() {
+        let mut session = ChatSessionV1 {
+            id: "fingerprint".into(),
+            title: None,
+            source: None,
+            model: None,
+            created_at: None,
+            metadata_json: String::new(),
+            messages: vec![MessageV1 {
+                role: MessageRole::Model,
+                content: "Done".into(),
+                tool_calls: Some(vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                    id: Some("call-1".into()),
+                }]),
+                tool_outputs: None,
+                id: None,
+                parent_id: None,
+                metadata_json: String::new(),
+            }],
+        };
+        let before = fingerprint_for_session(&session);
+        session.messages[0].tool_calls.as_mut().unwrap()[0].arguments =
+            r#"{"path":"b.txt"}"#.into();
+        assert_ne!(before, fingerprint_for_session(&session));
     }
 
     #[test]

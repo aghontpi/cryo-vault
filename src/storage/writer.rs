@@ -86,7 +86,7 @@ impl SessionWriter {
                 let (min_time, max_time) = crate::storage::compute_block_time_range(sessions);
 
                 crate::index::BlockIndex::new(
-                    session_ids.join(","),
+                    crate::index::encode_session_ids(&session_ids),
                     crate::index::BlockIndexParams {
                         content: &full_text,
                         min_time,
@@ -107,7 +107,7 @@ impl SessionWriter {
                 let max_time = session.created_at.unwrap_or(u64::MAX);
 
                 crate::index::BlockIndex::new(
-                    session.id.clone(),
+                    crate::index::encode_session_ids(std::slice::from_ref(&session.id)),
                     crate::index::BlockIndexParams {
                         content: &full_text,
                         min_time,

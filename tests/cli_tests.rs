@@ -207,6 +207,45 @@ fn test_cli_capture_changed_no_session_id_keeps_one_latest_revision() {
 }
 
 #[test]
+fn test_cli_capture_reimports_reverted_no_session_id_revision() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = import_root.join("revertible.json");
+
+    for content in ["revision A", "revision B", "revision A"] {
+        std::fs::write(
+            &transcript,
+            format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}]}}"#),
+        )
+        .unwrap();
+        let output = cryo_command(&db_path)
+            .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+            .args([
+                "capture",
+                "run",
+                "--platform",
+                "generic",
+                "--settle",
+                "0s",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["imported_sessions"], 1, "{content}");
+    }
+
+    cryo_command(&db_path)
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total Sessions:   1"));
+}
+
+#[test]
 fn test_cli_capture_json_settle_imports_without_transcript_content() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join(".cryo");

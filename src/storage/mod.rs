@@ -97,7 +97,7 @@ fn write_sessions_block(
     let (min_time, max_time) = compute_block_time_range(sessions);
 
     let index_entry = crate::index::BlockIndex::new(
-        session_ids.join(","),
+        crate::index::encode_session_ids(&session_ids),
         crate::index::BlockIndexParams {
             content: &full_text,
             min_time,
@@ -658,7 +658,7 @@ impl Storage {
                 idx_file.read_exact(&mut compressed)?;
                 let raw = zstd::decode_all(&compressed[..])?;
                 let index: crate::index::BlockIndex = bincode::deserialize(&raw)?;
-                for session_id in index.session_id.split(',') {
+                for session_id in crate::index::decode_session_ids(&index.session_id) {
                     latest_locations.insert(session_id.to_string(), (*segment, index.data_offset));
                 }
                 indexes.push(index);
@@ -699,9 +699,8 @@ impl Storage {
                 block_number += 1;
 
                 if let Some(index) = index {
-                    let has_visible_revision = index
-                        .session_id
-                        .split(',')
+                    let has_visible_revision = crate::index::decode_session_ids(&index.session_id)
+                        .iter()
                         .any(|id| latest_locations.get(id) == Some(&(segment, index.data_offset)));
                     if !has_visible_revision
                         || after.is_some_and(|ts| index.max_time < ts)
@@ -901,7 +900,10 @@ impl Storage {
                 let idx_buf = zstd::decode_all(&compressed_idx_buf[..])?;
                 let index: crate::index::BlockIndex = bincode::deserialize(&idx_buf)?;
 
-                if index.session_id.split(',').any(|id| id == session_id) {
+                if crate::index::decode_session_ids(&index.session_id)
+                    .iter()
+                    .any(|id| id == session_id)
+                {
                     let mut data_file = File::open(&path)?;
 
                     data_file.seek(io::SeekFrom::Start(index.data_offset))?;
@@ -1092,7 +1094,7 @@ impl Storage {
                     let (min_time, max_time) = compute_block_time_range(sessions);
 
                     let entry = crate::index::BlockIndex::new(
-                        session_ids.join(","),
+                        crate::index::encode_session_ids(&session_ids),
                         crate::index::BlockIndexParams {
                             content: &full_text,
                             min_time,
@@ -1114,7 +1116,7 @@ impl Storage {
                     let max_time = session.created_at.unwrap_or(u64::MAX);
 
                     let index_entry = crate::index::BlockIndex::new(
-                        session.id.clone(),
+                        crate::index::encode_session_ids(std::slice::from_ref(&session.id)),
                         crate::index::BlockIndexParams {
                             content: &full_text,
                             min_time,
