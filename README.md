@@ -122,11 +122,57 @@ JSON and ChatGPT-export imports remain available as the generic fallback.
 ```bash
 cryo capture run                         # capture all supported clients
 cryo capture run --platform claude-code  # capture one client
+cryo capture run --platform generic      # scan only CRYO_CAPTURE_IMPORT_ROOTS
 cryo capture run --dry-run               # inspect without writing
+cryo capture run --verbose               # print each candidate path and outcome
+cryo capture run --json                  # emit counters and safe candidate diagnostics
+cryo capture run --settle 2s              # re-observe unchanged files in this run
 cryo capture status
 cryo capture install --time 23:00
 cryo capture uninstall                   # removes the schedule, not the archive
 ```
+
+For a manual import of a static transcript, point the generic scanner at a
+temporary or chosen import directory and use a settled run. The settled run
+keeps the database lock while it waits and performs the second unchanged
+observation, so it can import a file in one command:
+
+```bash
+export CRYO_CAPTURE_IMPORT_ROOTS="$PWD/my-transcripts"
+cryo capture run --platform generic --settle 1s --verbose
+cryo search "a phrase from the transcript"
+```
+
+The `--platform` flag can narrow a scan to `codex`, `claude-code`, `copilot-cli`,
+`cursor`, `gemini-cli`, `antigravity`, or `generic`. A normal run never waits:
+the first observation is recorded and the next unchanged run imports the file.
+If that happens, the command prints the exact rerun command; use `--verbose` to
+see the paths and safe reasons. `--json` includes the same aggregate counters,
+per-platform discovery counts, and candidate outcomes, but never transcript
+message text.
+
+Capture is duplicate-safe by default: an unchanged source session (or a
+transcript with the same visible-content fingerprint when no source ID exists)
+is reported as `unchanged` with reason `duplicate already archived`, even after
+the state file is removed or a transcript is moved. Candidate reasons include
+`empty transcript`, `unsupported source record`, and `malformed transcript`.
+`first` and `last` use visible session timestamps and accept `--source
+<platform>` filters. Use `cryo show --diagnostics` for provenance and
+extraction metrics, or `cryo audit provenance` to find legacy sessions whose
+original source cannot be reconstructed.
+
+The repository includes a self-contained smoke test that uses only a temporary
+database and generic transcript root. It expects a built CLI binary (or the
+`CRYO_BIN` override):
+
+```bash
+cargo build
+./scripts/capture-smoke-test.sh
+```
+
+The nightly scheduler remains a single, non-waiting observation pass. Use
+`--settle` explicitly for manual runs or tests when waiting for a second
+observation is appropriate.
 
 Capture state is stored under the database directory in `capture-state.json`;
 end-of-session hints are first written as independent JSON records in the
