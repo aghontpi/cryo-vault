@@ -449,7 +449,8 @@ impl Storage {
         for id in &finalized_ids {
             // Only process if it was built from parts (exists in map)
             if let Some(input) = session_map.remove(id) {
-                let session_v1: ChatSessionV1 = input.into();
+                let mut session_v1: ChatSessionV1 = input.into();
+                ensure_ingestion_metadata(&mut session_v1, "stream");
                 // Skip an exact replay, but preserve a newer pending revision
                 // under the same stable session ID.
                 if self
@@ -1520,4 +1521,43 @@ fn sessions_equivalent(left: &ChatSessionV1, right: &ChatSessionV1) -> bool {
                 && a.tool_outputs.as_ref().map(|v| v.len())
                     == b.tool_outputs.as_ref().map(|v| v.len())
         })
+}
+
+fn ensure_ingestion_metadata(session: &mut ChatSessionV1, importer: &str) {
+    let mut metadata = serde_json::from_str::<serde_json::Value>(&session.metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata
+        .entry("importer")
+        .or_insert_with(|| serde_json::Value::String(importer.into()));
+    metadata
+        .entry("parser_version")
+        .or_insert_with(|| serde_json::Value::String("ingest-v1".into()));
+    metadata.entry("ingest_time").or_insert_with(|| {
+        serde_json::Value::Number((chrono::Utc::now().timestamp().max(0) as u64).into())
+    });
+    metadata.entry("source_platform").or_insert_with(|| {
+        serde_json::Value::String(session.source.clone().unwrap_or_else(|| "unknown".into()))
+    });
+    metadata
+        .entry("source_path")
+        .or_insert_with(|| serde_json::Value::String("unknown".into()));
+    metadata
+        .entry("source_session_id")
+        .or_insert_with(|| serde_json::Value::String(session.id.clone()));
+    metadata
+        .entry("records_read")
+        .or_insert_with(|| serde_json::Value::Number((session.messages.len() as u64).into()));
+    metadata.insert(
+        "visible_messages_extracted".into(),
+        serde_json::Value::Number((session.messages.len() as u64).into()),
+    );
+    metadata
+        .entry("records_skipped_by_reason")
+        .or_insert_with(|| serde_json::json!({}));
+    metadata
+        .entry("malformed_records")
+        .or_insert_with(|| serde_json::Value::Number(0.into()));
+    session.metadata_json = serde_json::Value::Object(metadata).to_string();
 }
