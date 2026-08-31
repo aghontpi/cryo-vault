@@ -1,3 +1,5 @@
-{"sessionId":"gemini-fixture-1","timestamp":1700000004,"model":"gemini-model","type":"user","content":"Check Gemini capture"}
-{"sessionId":"gemini-fixture-1","type":"model","content":"The settings file is not a transcript."}
-{"sessionId":"gemini-fixture-1","type":"tool_result","content":"scan complete"}
+{"type":"session_metadata","sessionId":"gemini-fixture-1","projectHash":"project-hash","startTime":"2023-11-14T22:13:20.000Z","lastUpdated":"2023-11-14T22:13:24.000Z"}
+{"id":"user-1","timestamp":"2023-11-14T22:13:21.000Z","type":"user","content":[{"text":"Check Gemini capture"}]}
+{"id":"gemini-1","timestamp":"2023-11-14T22:13:22.000Z","type":"gemini","model":"gemini-model","content":"The settings file is not a transcript.","toolCalls":[{"id":"tool-1","name":"read_file","args":{"path":"settings.json"},"result":[{"text":"scan complete"}],"status":"success","timestamp":"2023-11-14T22:13:23.000Z"}]}
+{"$rewindTo":"user-1"}
+{"$set":{"messages":[{"id":"user-1","timestamp":"2023-11-14T22:13:21.000Z","type":"user","content":[{"text":"Check Gemini capture"}]},{"id":"gemini-2","timestamp":"2023-11-14T22:13:24.000Z","type":"gemini","model":"gemini-model","content":"The settings file is not a transcript.","toolCalls":[{"id":"tool-2","name":"read_file","args":{"path":"settings.json"},"result":[{"text":"scan complete"}],"status":"success","timestamp":"2023-11-14T22:13:23.000Z"}]},{"id":"user-2","timestamp":"2023-11-14T22:13:24.000Z","type":"user","content":[{"text":"Archive the visible state"}]}]}}

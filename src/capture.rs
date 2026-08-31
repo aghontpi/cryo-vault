@@ -18,11 +18,14 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::schema::{ChatGptConversation, ChatSessionV1, MessageRole, MessageV1};
+use crate::schema::{
+    ChatGptConversation, ChatSessionV1, MessageRole, MessageV1, ToolCall, ToolOutput,
+};
 use crate::storage::Storage;
 
 pub const DEFAULT_CAPTURE_TIME: &str = "23:00";
 const STATE_FILE: &str = "capture-state.json";
+const DUPLICATE_FILE: &str = "capture-duplicate-keys.json";
 const HOOK_FILE: &str = "capture-hooks.jsonl";
 const HINT_QUEUE_DIR: &str = "capture-hints";
 const DEFAULT_STABLE_AGE_SECS: u64 = 60;
@@ -341,11 +344,7 @@ fn run_once(
             .or_default() += 1;
     }
     let storage = Storage::new(db_path.to_path_buf());
-    let archived_sessions = storage.scan_all()?;
-    let archived_duplicate_keys = archived_sessions
-        .iter()
-        .filter_map(session_duplicate_key)
-        .collect::<HashSet<_>>();
+    let archived_duplicate_keys = load_duplicate_keys(db_path)?;
     let mut imports = Vec::new();
     let mut pending_duplicate_keys = HashSet::new();
     let mut resolved_hint_paths = HashSet::new();
@@ -439,6 +438,13 @@ fn run_once(
 
         if already_captured {
             report.skipped_unchanged += 1;
+            if hinted_path {
+                // A duplicate lifecycle hook has done its job even when the
+                // transcript fingerprint was already archived. Leaving it in
+                // the queue would make a later resumed write bypass the
+                // two-observation stability guard.
+                resolved_hint_paths.insert(candidate.path.clone());
+            }
             add_candidate_report(
                 &mut report,
                 &candidate,
@@ -516,19 +522,6 @@ fn run_once(
                 .filter(|id| !id.is_empty() && id != "unknown");
             let existing = match storage.get_session_by_id(&session.id)? {
                 Some(existing) => Some(existing),
-                None if source_id.is_none() => {
-                    // Older capture builds used the content fingerprint as
-                    // the fallback session ID. Recover the path identity for
-                    // changed transcripts so their revisions still replace
-                    // the same logical record.
-                    archived_sessions
-                        .iter()
-                        .find(|archived| {
-                            metadata_value(archived, "source_path").as_deref() == Some(key.as_str())
-                                && metadata_platform(archived) == metadata_platform(&session)
-                        })
-                        .cloned()
-                }
                 None => None,
             };
             let session_fingerprint = fingerprint_for_session(&session);
@@ -590,8 +583,16 @@ fn run_once(
 
     if !options.dry_run && !imports.is_empty() {
         report.imported_sessions = storage.append_bulk(imports)?;
+        if !pending_duplicate_keys.is_empty() {
+            let mut duplicate_keys = archived_duplicate_keys;
+            duplicate_keys.extend(pending_duplicate_keys);
+            save_duplicate_keys(db_path, &duplicate_keys)?;
+        }
     } else if options.dry_run {
-        report.imported_sessions = report.stable_files.saturating_sub(report.skipped_unchanged);
+        // Count parsed, deduplicated sessions rather than candidate files.
+        // One transcript can contain multiple sessions, and malformed or
+        // unsupported stable files must not be reported as imported.
+        report.imported_sessions = imports.len();
     }
 
     state.last_run_at = Some(now);
@@ -801,6 +802,24 @@ fn save_state(db_path: &Path, state: &CaptureState) -> Result<()> {
     Ok(())
 }
 
+fn load_duplicate_keys(db_path: &Path) -> Result<HashSet<String>> {
+    let path = db_path.join(DUPLICATE_FILE);
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let bytes = fs::read(path).context("failed to read capture duplicate keys")?;
+    Ok(serde_json::from_slice(&bytes).context("failed to decode capture duplicate keys")?)
+}
+
+fn save_duplicate_keys(db_path: &Path, keys: &HashSet<String>) -> Result<()> {
+    fs::create_dir_all(db_path)?;
+    let path = db_path.join(DUPLICATE_FILE);
+    let temp = db_path.join("capture-duplicate-keys.json.tmp");
+    fs::write(&temp, serde_json::to_vec(keys)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
 pub fn clear_schedule(db_path: &Path) -> Result<()> {
     if !db_path.exists() {
         return Ok(());
@@ -817,7 +836,9 @@ pub fn parse_transcript(
 ) -> Result<Vec<ChatSessionV1>> {
     let file_fingerprint = fingerprint_bytes(bytes);
     let value = serde_json::from_slice::<Value>(bytes).ok();
-    let mut sessions = if platform == Platform::CopilotCli {
+    let mut sessions = if platform == Platform::GeminiCli {
+        parse_gemini_transcript(path, bytes, &file_fingerprint)?
+    } else if platform == Platform::CopilotCli {
         let copilot = parse_copilot_jsonl(path, bytes, &file_fingerprint)?;
         if copilot.is_empty() {
             if let Some(value) = value.as_ref() {
@@ -974,6 +995,7 @@ fn parse_jsonl(
                 continue;
             }
         };
+        let is_session_meta = value.get("type").and_then(Value::as_str) == Some("session_meta");
         session_id = session_id.or_else(|| {
             find_string(
                 &value,
@@ -984,9 +1006,40 @@ fn parse_jsonl(
                     "conversationId",
                 ],
             )
+            .or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(|payload| {
+                        find_string(
+                            payload,
+                            &[
+                                "session_id",
+                                "sessionId",
+                                "conversation_id",
+                                "conversationId",
+                                "id",
+                            ],
+                        )
+                    })
+            })
         });
-        model = model.or_else(|| find_string(&value, &["model", "model_name", "modelName"]));
-        created_at = created_at.or_else(|| find_timestamp(&value));
+        model = model.or_else(|| {
+            find_string(&value, &["model", "model_name", "modelName"]).or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(|payload| find_string(payload, &["model", "model_name", "modelName"]))
+            })
+        });
+        created_at = created_at.or_else(|| {
+            find_timestamp(&value).or_else(|| {
+                is_session_meta
+                    .then(|| value.get("payload"))
+                    .flatten()
+                    .and_then(find_timestamp)
+            })
+        });
         collect_message_records(&value, &mut messages);
     }
     if messages.is_empty() {
@@ -1010,6 +1063,258 @@ fn parse_jsonl(
         file_fingerprint,
     );
     Ok(vec![session])
+}
+
+/// Parse Gemini CLI recordings without treating control records as messages.
+///
+/// Modern Gemini sessions are JSONL streams whose records are either session
+/// metadata, visible `user`/`gemini` messages, or state changes. `$rewindTo`
+/// retains the record at the supplied message ID and drops everything after
+/// it. `$set.messages` is a checkpoint and replaces the current message set.
+/// Legacy `session-*.json` files contain the same metadata and messages in one
+/// JSON object and are handled by the same state machine.
+fn parse_gemini_transcript(
+    path: &Path,
+    bytes: &[u8],
+    file_fingerprint: &str,
+) -> Result<Vec<ChatSessionV1>> {
+    let mut metadata = Map::new();
+    let mut message_values = Vec::new();
+    let mut invalid_records = 0;
+
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        if let Some(object) = value.as_object() {
+            merge_gemini_metadata(&mut metadata, object);
+            if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+                message_values = messages.clone();
+            }
+        } else {
+            return Ok(Vec::new());
+        }
+    } else {
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let value = match serde_json::from_slice::<Value>(line) {
+                Ok(value) => value,
+                Err(_) => {
+                    invalid_records += 1;
+                    continue;
+                }
+            };
+            apply_gemini_record(&value, &mut metadata, &mut message_values);
+        }
+    }
+
+    if message_values.is_empty() {
+        if invalid_records > 0 {
+            return Err(anyhow!("malformed Gemini transcript"));
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut messages = Vec::new();
+    let mut model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    for value in &message_values {
+        if let Some(message) = gemini_message(value, &mut model) {
+            messages.push(message);
+        }
+    }
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let session_id = metadata
+        .get("sessionId")
+        .or_else(|| metadata.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let display_id = session_id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
+    let session = make_session(
+        Platform::GeminiCli,
+        path,
+        &display_id,
+        model,
+        metadata.get("startTime").and_then(value_timestamp),
+        messages,
+    );
+    Ok(vec![with_capture_metadata(
+        session,
+        Platform::GeminiCli,
+        path,
+        session_id.as_deref(),
+        file_fingerprint,
+    )])
+}
+
+fn apply_gemini_record(
+    value: &Value,
+    metadata: &mut Map<String, Value>,
+    messages: &mut Vec<Value>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(rewind_to) = object.get("$rewindTo").and_then(Value::as_str) {
+        if let Some(index) = messages
+            .iter()
+            .position(|message| message.get("id").and_then(Value::as_str) == Some(rewind_to))
+        {
+            messages.truncate(index + 1);
+        }
+        return;
+    }
+    if let Some(set) = object.get("$set").and_then(Value::as_object) {
+        merge_gemini_metadata(metadata, set);
+        if let Some(set_messages) = set.get("messages").and_then(Value::as_array) {
+            *messages = set_messages.clone();
+        }
+        return;
+    }
+    if object.get("type").and_then(Value::as_str) == Some("message_update") {
+        let Some(id) = object.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(existing) = messages
+            .iter_mut()
+            .find(|message| message.get("id").and_then(Value::as_str) == Some(id))
+        {
+            if let (Some(existing), Some(update)) = (existing.as_object_mut(), Some(object)) {
+                for (key, value) in update {
+                    if key != "type" {
+                        existing.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        return;
+    }
+    merge_gemini_metadata(metadata, object);
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("user" | "gemini")
+    ) {
+        messages.push(value.clone());
+    }
+}
+
+fn merge_gemini_metadata(metadata: &mut Map<String, Value>, object: &Map<String, Value>) {
+    for key in [
+        "sessionId",
+        "session_id",
+        "projectHash",
+        "startTime",
+        "lastUpdated",
+        "summary",
+        "model",
+        "kind",
+    ] {
+        if let Some(value) = object.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn gemini_message(value: &Value, model: &mut Option<String>) -> Option<MessageV1> {
+    let object = value.as_object()?;
+    let kind = object.get("type").and_then(Value::as_str)?;
+    let role = match kind {
+        "user" => MessageRole::User,
+        "gemini" => MessageRole::Model,
+        _ => return None,
+    };
+    if role == MessageRole::Model {
+        *model = object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| model.clone());
+    }
+    let content = object
+        .get("content")
+        .map(extract_visible_text)
+        .unwrap_or_default();
+    let tool_calls = object
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    let call = call.as_object()?;
+                    let name = call.get("name")?.as_str()?.to_string();
+                    let arguments = call
+                        .get("args")
+                        .or_else(|| call.get("arguments"))
+                        .map(|args| {
+                            args.as_str()
+                                .map(str::to_string)
+                                .or_else(|| serde_json::to_string(args).ok())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    Some(ToolCall {
+                        name,
+                        arguments,
+                        id: call.get("id").and_then(Value::as_str).map(str::to_string),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|calls| !calls.is_empty());
+    let tool_outputs = object
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    let call = call.as_object()?;
+                    let result = call.get("result")?;
+                    if result.is_null() {
+                        return None;
+                    }
+                    Some(ToolOutput {
+                        tool_call_id: call.get("id").and_then(Value::as_str).map(str::to_string),
+                        content: extract_visible_text(result),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|outputs| !outputs.is_empty());
+    if content.trim().is_empty() && tool_calls.is_none() {
+        return None;
+    }
+    Some(MessageV1 {
+        role,
+        content: content.trim().to_string(),
+        tool_calls,
+        tool_outputs,
+        id: object.get("id").and_then(Value::as_str).map(str::to_string),
+        parent_id: object
+            .get("parentId")
+            .or_else(|| object.get("parent_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        metadata_json: String::new(),
+    })
+}
+
+fn value_timestamp(value: &Value) -> Option<u64> {
+    value.as_str().and_then(|value| {
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|date| date.timestamp().max(0) as u64)
+    })
 }
 
 /// Copilot CLI writes an envelope whose visible payload is nested under
@@ -1349,6 +1654,7 @@ fn collect_message_records(value: &Value, out: &mut Vec<MessageV1>) {
             .or_else(|| object.get("text"))
             .or_else(|| object.get("parts"))
             .or_else(|| object.get("result"))
+            .or_else(|| object.get("message"))
             .map(extract_visible_text)
             .unwrap_or_default();
         if !content.trim().is_empty() {
@@ -1371,8 +1677,8 @@ fn collect_message_records(value: &Value, out: &mut Vec<MessageV1>) {
 
 fn normalize_role(role: &str) -> Option<MessageRole> {
     match role.to_ascii_lowercase().as_str() {
-        "user" | "human" | "user.message" | "prompt" => Some(MessageRole::User),
-        "assistant" | "model" | "ai" | "assistant.message" => Some(MessageRole::Model),
+        "user" | "human" | "user.message" | "user_message" | "prompt" => Some(MessageRole::User),
+        "assistant" | "model" | "ai" | "gemini" | "assistant.message" => Some(MessageRole::Model),
         "system" | "system.message" => Some(MessageRole::System),
         "tool" | "tool_result" | "tool-use" | "tool_call" | "function" => Some(MessageRole::Tool),
         "thought" | "thinking" | "reasoning" | "analysis" => Some(MessageRole::Thought),
@@ -1537,20 +1843,6 @@ fn normalized_visible_message_fingerprint(session: &ChatSessionV1) -> String {
     format!("{:016x}", fnv1a(normalized.as_bytes()))
 }
 
-fn session_duplicate_key(session: &ChatSessionV1) -> Option<String> {
-    let platform_session_id = metadata_value(session, "platform_session_id");
-    if platform_session_id
-        .as_deref()
-        .is_some_and(|id| !id.is_empty() && id != "unknown")
-    {
-        return None;
-    }
-    Some(canonical_duplicate_key(
-        &metadata_platform(session),
-        &normalized_visible_message_fingerprint(session),
-    ))
-}
-
 pub fn fingerprint_for_session(session: &ChatSessionV1) -> String {
     let mut bytes = Vec::new();
     for message in &session.messages {
@@ -1713,7 +2005,7 @@ fn allowed_transcript_path(platform: Platform, root: &Path, path: &Path) -> bool
                 })
         }
         Platform::GeminiCli => {
-            extension == Some("json")
+            matches!(extension, Some("json" | "jsonl"))
                 && components
                     .iter()
                     .any(|component| matches!(*component, "chats" | "sessions" | "tmp"))
@@ -2759,6 +3051,50 @@ mod tests {
     }
 
     #[test]
+    fn gemini_modern_records_keep_tool_calls_and_checkpoint_state() {
+        let path = Path::new("session-modern.jsonl");
+        let input = br#"{"type":"session_metadata","sessionId":"modern-gemini","startTime":"2024-01-01T00:00:00Z"}
+{"id":"u1","type":"user","content":[{"text":"old prompt"}]}
+{"id":"g1","type":"gemini","content":"old answer"}
+{"$rewindTo":"u1"}
+{"$set":{"messages":[{"id":"u1","type":"user","content":[{"text":"visible prompt"}]},{"id":"g2","type":"gemini","model":"gemini-2","content":"visible answer","toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"README.md"},"result":[{"text":"file contents"}],"status":"success","timestamp":"2024-01-01T00:00:03Z"}]}]}}
+"#;
+        let sessions = parse_transcript(Platform::GeminiCli, path, input).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 2);
+        assert_eq!(sessions[0].messages[1].role, MessageRole::Model);
+        assert_eq!(
+            sessions[0].messages[1].tool_calls.as_ref().unwrap()[0].name,
+            "read_file"
+        );
+        assert_eq!(
+            sessions[0].messages[1].tool_outputs.as_ref().unwrap()[0].content,
+            "file contents"
+        );
+        assert_eq!(
+            metadata_value(&sessions[0], "platform_session_id").as_deref(),
+            Some("modern-gemini")
+        );
+    }
+
+    #[test]
+    fn gemini_discovery_accepts_current_project_chat_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(".gemini");
+        let chats = root.join("tmp/project-hash/chats");
+        fs::create_dir_all(&chats).unwrap();
+        fs::write(chats.join("session-2024.jsonl"), "{}").unwrap();
+        fs::write(chats.join("settings.json"), "{}").unwrap();
+        let candidates = discover_candidates(&[(Platform::GeminiCli, root)]);
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0]
+                .path
+                .ends_with("tmp/project-hash/chats/session-2024.jsonl")
+        );
+    }
+
+    #[test]
     fn copilot_events_extract_nested_visible_turns_and_tool_context() {
         let path = Path::new("events.jsonl");
         let input = br#"{"type":"user.message","data":{"sessionId":"nested-1","timestamp":1700000000,"content":"hello"}}
@@ -2799,7 +3135,9 @@ mod tests {
     #[test]
     fn a_path_hint_bypasses_stability_and_is_consumed() {
         let dir = TempDir::new().unwrap();
-        let file = dir.path().join("session.json");
+        let root = dir.path().join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("session.json");
         fs::write(
             &file,
             json!({"session_id":"hinted","messages":[{"role":"user","content":"hello"}]})
@@ -3106,6 +3444,65 @@ mod tests {
         assert_eq!(report.imported_sessions, 1);
         assert!(load_state(&db).unwrap().pending_hooks.is_empty());
         assert_eq!(Storage::new(db).scan_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_hint_for_captured_file_is_consumed_before_resume() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("session.json");
+        fs::write(
+            &file,
+            json!({
+                "session_id": "resumable-hint",
+                "messages": [{"role": "user", "content": "initial"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let db = dir.path().join("db");
+        let roots = vec![(Platform::Generic, root)];
+
+        assert_eq!(
+            run_with_roots(&db, &CaptureOptions::default(), &roots)
+                .unwrap()
+                .imported_sessions,
+            0
+        );
+        assert_eq!(
+            run_with_roots(&db, &CaptureOptions::default(), &roots)
+                .unwrap()
+                .imported_sessions,
+            1
+        );
+
+        record_hook_hint(
+            &db,
+            HookHint {
+                platform: Platform::Generic,
+                session_id: Some("resumable-hint".into()),
+                path: Some(file.to_string_lossy().into()),
+                seen_at: now_secs(),
+            },
+        )
+        .unwrap();
+        let unchanged = run_with_roots(&db, &CaptureOptions::default(), &roots).unwrap();
+        assert_eq!(unchanged.imported_sessions, 0);
+        assert!(load_state(&db).unwrap().pending_hooks.is_empty());
+
+        fs::write(
+            &file,
+            json!({
+                "session_id": "resumable-hint",
+                "messages": [{"role": "user", "content": "resumed"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let resumed = run_with_roots(&db, &CaptureOptions::default(), &roots).unwrap();
+        assert_eq!(resumed.imported_sessions, 0);
+        assert_eq!(resumed.skipped_unstable, 1);
     }
 
     #[test]
