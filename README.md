@@ -155,7 +155,8 @@ Capture is duplicate-safe by default: an unchanged source session (or a
 transcript with the same visible-content fingerprint when no source ID exists)
 is reported as `unchanged` with reason `duplicate already archived`, even after
 the state file is removed or a transcript is moved. Candidate reasons include
-`empty transcript`, `unsupported source record`, and `malformed transcript`.
+`empty transcript`, `unsupported source record`, `no visible conversation
+records`, and `malformed transcript`.
 `first` and `last` use visible session timestamps and accept `--source
 <platform>` filters. Use `cryo show --diagnostics` for provenance and
 extraction metrics, or `cryo audit provenance` to find legacy sessions whose
@@ -196,9 +197,13 @@ CLI uses an `agentStop` hook in `~/.copilot/hooks/cryo-vault.json` with its Unix
 uses a named `Stop` hook in `~/.gemini/config/hooks.json`. Antigravity transcript discovery reads
 `~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript.jsonl`,
 with the old `antigravity-ide` and `antigravity` roots retained as read-only
-fallbacks. History, cache, settings, database files, and
-`transcript_full.jsonl` are excluded. The installer preserves unrelated hook
-configuration and removes only Cryo Vault entries.
+fallbacks. Antigravity's system-generated event records are parsed into visible
+user, model, and tool turns; damaged JSONL lines are skipped when valid turns
+surround them. A system-only file is reported as `no visible conversation
+records`; `malformed transcript` means that no usable records could be
+recovered. History, cache, settings, database files, and `transcript_full.jsonl`
+are excluded. The installer preserves unrelated hook configuration and removes
+only Cryo Vault entries.
 
 Privacy is local-only: Cryo Vault reads supported files from the local user
 profile and writes only to the configured local database. It does not upload

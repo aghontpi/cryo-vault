@@ -1,0 +1,4 @@
+{"timestamp":1700000010,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Keep valid records around the damaged line"}
+{"timestamp":1700000011,"source":"MODEL","type":"PLANNER_RESPONSE","content":"The valid records are recoverable."}
+{"source":"MODEL","type":"RUN_COMMAND","content":"cargo test"}
+truncated task-log path from an interrupted write

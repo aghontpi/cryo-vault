@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -456,8 +456,8 @@ fn run_once(
             continue;
         }
 
-        let sessions = match parse_transcript(candidate.platform, &candidate.path, &bytes) {
-            Ok(sessions) => sessions,
+        let parsed = match parse_transcript_detailed(candidate.platform, &candidate.path, &bytes) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 tracing::warn!(path = %candidate.path.display(), %error, "capture skipped malformed transcript");
                 report.failed_files += 1;
@@ -472,25 +472,18 @@ fn run_once(
                 continue;
             }
         };
+        let sessions = parsed.sessions;
         if sessions.is_empty() {
             report.skipped_empty += 1;
-            let reason = if bytes.iter().any(|byte| !byte.is_ascii_whitespace())
-                && (serde_json::from_slice::<Value>(&bytes).is_ok()
-                    || bytes
-                        .split(|byte| *byte == b'\n')
-                        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-                        .all(|line| serde_json::from_slice::<Value>(line).is_ok()))
-            {
+            let reason = parsed.empty_reason.unwrap_or(EmptyTranscriptReason::Empty);
+            if reason == EmptyTranscriptReason::UnsupportedSourceRecord {
                 report.skipped_unsupported += 1;
-                "unsupported source record"
-            } else {
-                "empty transcript"
-            };
+            }
             add_candidate_report(
                 &mut report,
                 &candidate,
                 "empty",
-                Some(reason.to_string()),
+                Some(reason.as_str().to_string()),
                 pass,
                 observer,
             );
@@ -847,9 +840,44 @@ pub fn parse_transcript(
     path: &Path,
     bytes: &[u8],
 ) -> Result<Vec<ChatSessionV1>> {
+    Ok(parse_transcript_detailed(platform, path, bytes)?.sessions)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyTranscriptReason {
+    Empty,
+    NoVisibleConversationRecords,
+    UnsupportedSourceRecord,
+}
+
+impl EmptyTranscriptReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty transcript",
+            Self::NoVisibleConversationRecords => "no visible conversation records",
+            Self::UnsupportedSourceRecord => "unsupported source record",
+        }
+    }
+}
+
+struct ParsedTranscript {
+    sessions: Vec<ChatSessionV1>,
+    empty_reason: Option<EmptyTranscriptReason>,
+}
+
+fn parse_transcript_detailed(
+    platform: Platform,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<ParsedTranscript> {
     let file_fingerprint = fingerprint_bytes(bytes);
     let value = serde_json::from_slice::<Value>(bytes).ok();
-    let mut sessions = if platform == Platform::Codex {
+    let mut empty_reason = None;
+    let mut sessions = if platform == Platform::Antigravity {
+        let parsed = parse_antigravity_transcript(path, bytes, &file_fingerprint)?;
+        empty_reason = parsed.empty_reason;
+        parsed.sessions
+    } else if platform == Platform::Codex {
         parse_codex_jsonl(path, bytes, &file_fingerprint)?
     } else if platform == Platform::GeminiCli {
         parse_gemini_transcript(path, bytes, &file_fingerprint)?
@@ -870,6 +898,9 @@ pub fn parse_transcript(
         parse_jsonl(platform, path, bytes, &file_fingerprint)?
     };
     sessions.retain(|s| !s.messages.is_empty());
+    if sessions.is_empty() && empty_reason.is_none() {
+        empty_reason = Some(classify_empty_transcript(bytes));
+    }
     let records_read = if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         value.as_array().map_or(1, Vec::len)
     } else {
@@ -900,7 +931,27 @@ pub fn parse_transcript(
             hidden_reasoning,
         );
     }
-    Ok(sessions)
+    Ok(ParsedTranscript {
+        sessions,
+        empty_reason,
+    })
+}
+
+fn classify_empty_transcript(bytes: &[u8]) -> EmptyTranscriptReason {
+    let has_non_blank = bytes.iter().any(|byte| !byte.is_ascii_whitespace());
+    if !has_non_blank {
+        return EmptyTranscriptReason::Empty;
+    }
+    let valid_document = serde_json::from_slice::<Value>(bytes).is_ok();
+    let valid_jsonl = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .all(|line| serde_json::from_slice::<Value>(line).is_ok());
+    if valid_document || valid_jsonl {
+        EmptyTranscriptReason::UnsupportedSourceRecord
+    } else {
+        EmptyTranscriptReason::Empty
+    }
 }
 
 fn update_capture_metrics(
@@ -1078,6 +1129,312 @@ fn parse_jsonl(
         file_fingerprint,
     );
     Ok(vec![session])
+}
+
+struct AntigravityParse {
+    sessions: Vec<ChatSessionV1>,
+    empty_reason: Option<EmptyTranscriptReason>,
+}
+
+/// Parse Antigravity's system-generated event stream. These records are not
+/// role/content JSONL: `source` and `type` describe user input, model
+/// responses, tool execution, and internal system state separately.
+fn parse_antigravity_transcript(
+    path: &Path,
+    bytes: &[u8],
+    file_fingerprint: &str,
+) -> Result<AntigravityParse> {
+    let mut messages = Vec::new();
+    let mut session_id = None;
+    let mut model = None;
+    let mut created_at = None;
+    let mut invalid_lines = 0;
+    let mut recognized_record = false;
+    let mut unsupported_record = false;
+
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                invalid_lines += 1;
+                continue;
+            }
+        };
+        let Some(object) = value.as_object() else {
+            unsupported_record = true;
+            continue;
+        };
+
+        session_id = session_id.or_else(|| {
+            find_string(
+                &value,
+                &[
+                    "conversation_id",
+                    "conversationId",
+                    "session_id",
+                    "sessionId",
+                ],
+            )
+        });
+        model = model.or_else(|| antigravity_model_id(object));
+        created_at = created_at.or_else(|| find_timestamp(&value));
+
+        match antigravity_record_message(object) {
+            AntigravityRecord::Message(message) => {
+                recognized_record = true;
+                messages.push(message);
+            }
+            AntigravityRecord::Recognized => recognized_record = true,
+            AntigravityRecord::Unsupported => unsupported_record = true,
+        }
+    }
+
+    if messages.is_empty() {
+        if invalid_lines > 0 {
+            return Err(anyhow!("malformed Antigravity transcript"));
+        }
+        return Ok(AntigravityParse {
+            sessions: Vec::new(),
+            empty_reason: Some(if unsupported_record {
+                EmptyTranscriptReason::UnsupportedSourceRecord
+            } else if recognized_record {
+                EmptyTranscriptReason::NoVisibleConversationRecords
+            } else {
+                EmptyTranscriptReason::Empty
+            }),
+        });
+    }
+
+    let source_id = session_id.or_else(|| antigravity_brain_session_id(path));
+    let display_id = source_id.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
+    let session = make_session(
+        Platform::Antigravity,
+        path,
+        &display_id,
+        model,
+        created_at,
+        messages,
+    );
+    Ok(AntigravityParse {
+        sessions: vec![with_capture_metadata(
+            session,
+            Platform::Antigravity,
+            path,
+            source_id.as_deref(),
+            file_fingerprint,
+        )],
+        empty_reason: None,
+    })
+}
+
+enum AntigravityRecord {
+    Message(MessageV1),
+    Recognized,
+    Unsupported,
+}
+
+fn antigravity_record_message(object: &Map<String, Value>) -> AntigravityRecord {
+    let source = object
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|source| source.to_ascii_uppercase());
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|event_type| event_type.to_ascii_uppercase());
+    let Some(event_type) = event_type else {
+        return AntigravityRecord::Unsupported;
+    };
+    if source.as_deref() == Some("SYSTEM") {
+        return AntigravityRecord::Recognized;
+    }
+
+    if source.as_deref() == Some("USER_EXPLICIT") && event_type == "USER_INPUT" {
+        let content = antigravity_visible_content(object);
+        if content.trim().is_empty() {
+            return AntigravityRecord::Recognized;
+        }
+        return AntigravityRecord::Message(antigravity_message(
+            MessageRole::User,
+            content,
+            None,
+            &event_type,
+            object,
+        ));
+    }
+
+    if source.as_deref() != Some("MODEL") {
+        return AntigravityRecord::Unsupported;
+    }
+
+    if antigravity_model_response_type(&event_type) {
+        let tool_calls = antigravity_tool_calls(object);
+        let content = antigravity_visible_content(object);
+        if content.trim().is_empty() && tool_calls.is_none() {
+            return AntigravityRecord::Recognized;
+        }
+        return AntigravityRecord::Message(antigravity_message(
+            MessageRole::Model,
+            content,
+            tool_calls,
+            &event_type,
+            object,
+        ));
+    }
+
+    if antigravity_tool_event_type(&event_type) {
+        let content = antigravity_visible_content(object);
+        if content.trim().is_empty() {
+            return AntigravityRecord::Recognized;
+        }
+        return AntigravityRecord::Message(antigravity_message(
+            MessageRole::Tool,
+            content,
+            None,
+            &event_type,
+            object,
+        ));
+    }
+
+    AntigravityRecord::Unsupported
+}
+
+fn antigravity_message(
+    role: MessageRole,
+    content: String,
+    tool_calls: Option<Vec<ToolCall>>,
+    event_type: &str,
+    object: &Map<String, Value>,
+) -> MessageV1 {
+    MessageV1 {
+        role,
+        content: content.trim().to_string(),
+        tool_calls,
+        tool_outputs: None,
+        id: find_string(
+            &Value::Object(object.clone()),
+            &["id", "message_id", "messageId"],
+        ),
+        parent_id: find_string(&Value::Object(object.clone()), &["parent_id", "parentId"]),
+        metadata_json: json!({"event_type": event_type}).to_string(),
+    }
+}
+
+fn antigravity_model_response_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "PLANNER_RESPONSE"
+            | "MODEL_RESPONSE"
+            | "ASSISTANT_RESPONSE"
+            | "FINAL_RESPONSE"
+            | "TEXT_RESPONSE"
+    )
+}
+
+fn antigravity_tool_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "LIST_DIRECTORY"
+            | "VIEW_FILE"
+            | "RUN_COMMAND"
+            | "GENERIC"
+            | "SEARCH_FILES"
+            | "READ_FILE"
+            | "WRITE_FILE"
+            | "EDIT_FILE"
+            | "DELETE_FILE"
+            | "BROWSER"
+            | "BROWSER_ACTION"
+            | "TASK_STATUS"
+            | "TASK_STARTED"
+            | "TASK_UPDATED"
+            | "TASK_COMPLETED"
+            | "TASK_FAILED"
+            | "TASK_CANCELLED"
+    )
+}
+
+fn antigravity_visible_content(object: &Map<String, Value>) -> String {
+    for key in ["content", "text", "result", "output", "details", "command"] {
+        if let Some(value) = object.get(key) {
+            let content = extract_visible_text(value);
+            if !content.trim().is_empty() {
+                return content;
+            }
+        }
+    }
+    String::new()
+}
+
+fn antigravity_tool_calls(object: &Map<String, Value>) -> Option<Vec<ToolCall>> {
+    let calls = object
+        .get("tool_calls")
+        .or_else(|| object.get("toolCalls"))
+        .and_then(|value| value.as_array())?;
+    let calls = calls
+        .iter()
+        .filter_map(|call| {
+            let call = call.as_object()?;
+            let name = call
+                .get("name")
+                .or_else(|| call.get("tool_name"))
+                .and_then(Value::as_str)?;
+            let arguments = call
+                .get("arguments")
+                .or_else(|| call.get("args"))
+                .or_else(|| call.get("input"))
+                .or_else(|| call.get("parameters"))
+                .map(antigravity_json_text)
+                .unwrap_or_default();
+            Some(ToolCall {
+                name: name.to_string(),
+                arguments,
+                id: call
+                    .get("id")
+                    .or_else(|| call.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn antigravity_json_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| serde_json::to_string(value).ok())
+        .unwrap_or_default()
+}
+
+fn antigravity_model_id(object: &Map<String, Value>) -> Option<String> {
+    ["model", "model_name", "modelName"].iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn antigravity_brain_session_id(path: &Path) -> Option<String> {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    components
+        .windows(2)
+        .find(|components| components[0] == "brain" && Uuid::parse_str(components[1]).is_ok())
+        .map(|components| components[1].to_string())
 }
 
 /// Parse Codex rollouts using the canonical response-item history. Codex can
@@ -3199,7 +3556,11 @@ mod tests {
             let input = fs::read(&path).unwrap();
             let sessions = parse_transcript(platform, &path, &input).unwrap();
             assert_eq!(sessions.len(), 1, "{platform}");
-            let expected_messages = if platform == Platform::Codex { 2 } else { 3 };
+            let expected_messages = match platform {
+                Platform::Codex => 2,
+                Platform::Antigravity => 4,
+                _ => 3,
+            };
             assert_eq!(sessions[0].messages.len(), expected_messages, "{platform}");
             if platform == Platform::Codex {
                 assert_eq!(
@@ -3236,6 +3597,161 @@ mod tests {
                     .contains("private reasoning")
             );
         }
+    }
+
+    #[test]
+    fn antigravity_events_preserve_visible_turns_tool_calls_and_metadata() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/capture/antigravity-v1.jsonl");
+        let sessions =
+            parse_transcript(Platform::Antigravity, &path, &fs::read(&path).unwrap()).unwrap();
+        let session = &sessions[0];
+
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages[1].role, MessageRole::Model);
+        assert_eq!(session.messages[2].role, MessageRole::Tool);
+        assert_eq!(session.messages[3].role, MessageRole::Model);
+        assert_eq!(session.messages[2].content, "path verified");
+        assert_eq!(
+            session.messages[3].tool_calls.as_ref().unwrap()[0],
+            ToolCall {
+                name: "list_directory".into(),
+                arguments: r#"{"path":"."}"#.into(),
+                id: Some("call-1".into()),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&session.messages[1].metadata_json).unwrap()["event_type"],
+            "PLANNER_RESPONSE"
+        );
+        assert_eq!(session.created_at, Some(1_700_000_005));
+        assert_eq!(
+            metadata_value(session, "platform_session_id").as_deref(),
+            Some("antigravity-fixture-1")
+        );
+        assert!(!session.extract_full_text().contains("private checkpoint"));
+        assert_eq!(metadata_u64(session, "malformed_records"), Some(0));
+    }
+
+    #[test]
+    fn antigravity_path_identity_and_partial_record_recovery_are_stable() {
+        let dir = TempDir::new().unwrap();
+        let brain_id = "123e4567-e89b-12d3-a456-426614174000";
+        let path = dir.path().join(format!(
+            "brain/{brain_id}/.system_generated/logs/transcript.jsonl"
+        ));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/capture/antigravity-mixed-validity-v1.jsonl");
+        let sessions =
+            parse_transcript(Platform::Antigravity, &path, &fs::read(&fixture).unwrap()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 3);
+        assert_eq!(
+            metadata_value(&sessions[0], "platform_session_id").as_deref(),
+            Some(brain_id)
+        );
+        assert_eq!(metadata_u64(&sessions[0], "malformed_records"), Some(1));
+        assert_eq!(metadata_u64(&sessions[0], "records_read"), Some(4));
+    }
+
+    #[test]
+    fn antigravity_empty_diagnostics_distinguish_system_only_and_malformed() {
+        let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/capture");
+        let system_only = fs::read(fixture_dir.join("antigravity-system-only-v1.jsonl")).unwrap();
+        assert!(
+            parse_transcript(
+                Platform::Antigravity,
+                Path::new("system-only.jsonl"),
+                &system_only
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let invalid = fs::read(fixture_dir.join("antigravity-invalid-v1.jsonl")).unwrap();
+        assert!(
+            parse_transcript(Platform::Antigravity, Path::new("invalid.jsonl"), &invalid).is_err()
+        );
+
+        let root = TempDir::new().unwrap();
+        let logs = root.path().join("brain/system-only/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), &system_only).unwrap();
+        let invalid_logs = root.path().join("brain/invalid/.system_generated/logs");
+        fs::create_dir_all(&invalid_logs).unwrap();
+        fs::write(invalid_logs.join("transcript.jsonl"), &invalid).unwrap();
+        let db = root.path().join("db");
+        let options = CaptureOptions::default();
+        run_with_roots(
+            &db,
+            &options,
+            &[(Platform::Antigravity, root.path().to_path_buf())],
+        )
+        .unwrap();
+        let report = run_with_roots(
+            &db,
+            &options,
+            &[(Platform::Antigravity, root.path().to_path_buf())],
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.path.contains("system-only"))
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("no visible conversation records")
+        );
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.path.contains("brain/invalid"))
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("malformed transcript")
+        );
+    }
+
+    #[test]
+    fn antigravity_real_discovery_layout_is_idempotent() {
+        let root = TempDir::new().unwrap();
+        let logs = root
+            .path()
+            .join("brain/123e4567-e89b-12d3-a456-426614174001/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/capture/antigravity-v1.jsonl");
+        fs::copy(&fixture, logs.join("transcript.jsonl")).unwrap();
+        fs::write(
+            logs.join("transcript_full.jsonl"),
+            fs::read(&fixture).unwrap(),
+        )
+        .unwrap();
+        let db = root.path().join("db");
+        let roots = vec![(Platform::Antigravity, root.path().to_path_buf())];
+        let options = CaptureOptions {
+            dry_run: false,
+            ..Default::default()
+        };
+
+        let first = run_with_roots(&db, &options, &roots).unwrap();
+        assert_eq!(first.imported_sessions, 0);
+        let second = run_with_roots(&db, &options, &roots).unwrap();
+        assert_eq!(second.imported_sessions, 1);
+        assert_eq!(second.extraction_metrics.len(), 1);
+        assert_eq!(
+            second.extraction_metrics.values().next().unwrap()["visible_messages_extracted"],
+            4
+        );
+        let third = run_with_roots(&db, &options, &roots).unwrap();
+        assert_eq!(third.imported_sessions, 0);
+        assert!(third.skipped_unchanged > 0);
+        assert_eq!(Storage::new(db).scan_all().unwrap().len(), 1);
     }
 
     #[test]

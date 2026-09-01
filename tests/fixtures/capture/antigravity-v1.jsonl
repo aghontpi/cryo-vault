@@ -1,3 +1,5 @@
-{"conversationId":"antigravity-fixture-1","timestamp":1700000005,"model":"antigravity-model","role":"user","content":"Check Antigravity transcript paths"}
-{"conversationId":"antigravity-fixture-1","role":"assistant","content":"Use the IDE transcript.jsonl layout."}
-{"conversationId":"antigravity-fixture-1","role":"tool","content":"path verified"}
+{"conversationId":"antigravity-fixture-1","timestamp":1700000005,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"Check Antigravity transcript paths"}
+{"conversationId":"antigravity-fixture-1","timestamp":1700000006,"source":"MODEL","type":"PLANNER_RESPONSE","content":"I will inspect the transcript layout.","model":"antigravity-model"}
+{"conversationId":"antigravity-fixture-1","timestamp":1700000007,"source":"MODEL","type":"RUN_COMMAND","content":"path verified"}
+{"conversationId":"antigravity-fixture-1","timestamp":1700000008,"source":"SYSTEM","type":"CHECKPOINT","content":"private checkpoint and internal instructions"}
+{"conversationId":"antigravity-fixture-1","timestamp":1700000009,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"id":"call-1","name":"list_directory","arguments":{"path":"."}}]}

@@ -142,7 +142,7 @@ enum CaptureCommands {
         #[arg(long)]
         dry_run: bool,
         /// Print one diagnostic for every discovered candidate
-        #[arg(short = 'v', long, conflicts_with = "json")]
+        #[arg(short = 'v', long)]
         verbose: bool,
         /// Print aggregate and per-candidate diagnostics as JSON
         #[arg(long)]
