@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run tests
+        run: cargo test
+      - name: Run capture smoke test
+        run: ./scripts/capture-smoke-test.sh
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            extension: ''
+            builder: cargo
+          - label: macOS x64
+            runner: macos-14
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x64
+            extension: ''
+            builder: cargo
+          - label: Linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+            extension: ''
+            builder: zig
+          - label: Linux arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            extension: ''
+            builder: zig
+          - label: Windows x64
+            runner: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            platform: windows
+            arch: x64
+            extension: '.exe'
+            builder: zig
+          - label: Windows arm64
+            runner: ubuntu-latest
+            target: aarch64-pc-windows-gnullvm
+            platform: windows
+            arch: arm64
+            extension: '.exe'
+            builder: zig
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Zig
+        if: matrix.builder == 'zig'
+        uses: goto-bus-stop/setup-zig@v2
+      - name: Install cargo-zigbuild
+        if: matrix.builder == 'zig'
+        run: cargo install cargo-zigbuild --locked
+      - name: Build release binaries
+        shell: bash
+        run: |
+          if [[ "${{ matrix.builder }}" == zig ]]; then
+            cargo zigbuild --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

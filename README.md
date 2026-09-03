@@ -75,6 +75,25 @@ cargo build --release
 > For convenience, alias the CLI binary:
 > `alias cryo="./target/release/cryo-vault"`
 
+### 3. Releases
+
+Release binaries are built by GitHub Actions from the reviewed `main` commit,
+not from a developer workstation. Pull requests produce retained build artifacts
+for all supported desktop targets. Stable releases use a two-step manual flow:
+
+1. Run **Prepare release** from `main` with a `vX.Y.Z` tag and the `draft`
+   stage. It validates the tag against `Cargo.toml`, builds all release binaries,
+   attaches them with `SHA256SUMS-vX.Y.Z.txt`, and creates or refreshes a draft.
+2. Review the draft notes and assets, then run the same workflow with the
+   `publish` stage. Publishing requires the repository's protected `release`
+   environment approval.
+
+Verify downloaded binaries from a release with:
+
+```bash
+shasum -a 256 -c SHA256SUMS-vX.Y.Z.txt
+```
+
 ---
 
 ## Usage Guide
