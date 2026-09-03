@@ -95,9 +95,23 @@ jobs:
           cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
           cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
       - name: Upload release artifacts
+        id: upload_artifacts
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
           retention-days: 14
+      - name: Retry artifact upload
+        id: retry_upload_artifacts
+        if: steps.upload_artifacts.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}-retry
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Fail if artifact upload did not recover
+        if: steps.upload_artifacts.outcome == 'failure' && steps.retry_upload_artifacts.outcome == 'failure'
+        run: exit 1
