@@ -2,9 +2,11 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use cryo_vault::capture::{self, CaptureOptions, HookHint, Platform};
 use cryo_vault::lock::CryoLock;
 use cryo_vault::schema::{ChatGptConversation, ChatSessionInput, ChatSessionV1, StreamEvent};
 use cryo_vault::storage::Storage;
@@ -27,6 +29,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Discover and archive local coding-agent transcripts
+    Capture {
+        #[command(subcommand)]
+        command: CaptureCommands,
+    },
     /// Ingest a chat log (File or Stdin)
     Add {
         /// Input file (Use "-" for stdin)
@@ -67,6 +74,9 @@ enum Commands {
         /// Number of sessions to show
         #[arg(default_value = "10")]
         count: usize,
+        /// Filter by captured source platform
+        #[arg(long)]
+        source: Option<String>,
     },
 
     /// Show last N sessions (newest)
@@ -74,12 +84,23 @@ enum Commands {
         /// Number of sessions to show
         #[arg(default_value = "10")]
         count: usize,
+        /// Filter by captured source platform
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Audit archive provenance
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
     },
 
     /// Show full session details
     Show {
         /// Session ID
-        session_id: String,
+        session_id: Option<String>,
+        /// Render provenance and extraction metrics instead of message bodies
+        #[arg(long)]
+        diagnostics: bool,
     },
 
     /// Rebuild index from existing data files
@@ -98,6 +119,74 @@ enum Commands {
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// List sessions whose original source cannot be reconstructed
+    Provenance,
+}
+
+#[derive(Subcommand)]
+enum CaptureCommands {
+    /// Run one capture pass
+    Run {
+        /// Source platform to scan (default: all)
+        #[arg(long, default_value = "all")]
+        platform: String,
+        /// Scheduled time used for validation and reporting
+        #[arg(long, default_value = "23:00")]
+        time: String,
+        /// Inspect and parse without writing archive or state files
+        #[arg(long)]
+        dry_run: bool,
+        /// Print one diagnostic for every discovered candidate
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Print aggregate and per-candidate diagnostics as JSON
+        #[arg(long)]
+        json: bool,
+        /// Wait before re-observing unchanged candidates (for example: 2s, 500ms)
+        #[arg(long, value_parser = parse_settle_duration)]
+        settle: Option<Duration>,
+    },
+    /// Install the native nightly scheduler
+    Install {
+        /// Source platform to document in the scheduled job (default: all)
+        #[arg(long, default_value = "all")]
+        platform: String,
+        /// Local time in HH:MM format
+        #[arg(long, default_value = "23:00")]
+        time: String,
+        /// Show scheduler changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show capture state and scheduler status
+    Status {
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the native nightly scheduler (archive data is retained)
+    Uninstall {
+        /// Show scheduler changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record a lightweight end-of-session hint for the next collector run
+    #[command(hide = true)]
+    Hint {
+        #[arg(long)]
+        platform: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Read session_id/transcript_path from the lifecycle hook's JSON stdin.
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -121,6 +210,18 @@ fn parse_date_or_timestamp(input: &str) -> Result<u64> {
     ))
 }
 
+fn parse_settle_duration(input: &str) -> Result<Duration, String> {
+    capture::parse_settle_duration(input).map_err(|error| error.to_string())
+}
+
+fn capture_rerun_command(platform: Platform) -> String {
+    if platform == Platform::All {
+        "cryo capture run".to_string()
+    } else {
+        format!("cryo capture run --platform {platform}")
+    }
+}
+
 /// Helper function to print a list of sessions with previews
 fn print_session_list(sessions: &[ChatSessionV1]) {
     for session in sessions {
@@ -129,23 +230,39 @@ fn print_session_list(sessions: &[ChatSessionV1]) {
             session.id,
             session.title.as_deref().unwrap_or("Untitled")
         );
+        println!(
+            "  Source: {}",
+            session.source.as_deref().unwrap_or("unknown")
+        );
+        println!("  Model: {}", session.model.as_deref().unwrap_or("unknown"));
+        println!(
+            "  Created: {}",
+            session
+                .created_at
+                .map(|created| created.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
         println!("  Messages: {}", session.messages.len());
-        if !session.messages.is_empty() {
-            let preview = &session.messages[0].content;
-            let preview_text = if preview.len() > 60 {
-                format!("{}...", &preview[..60])
-            } else {
-                preview.clone()
-            };
-            println!("  Preview: {}", preview_text);
-        }
         println!();
     }
 }
 
 /// Helper function to display first or last N sessions
-fn display_sessions(storage: Storage, count: usize, first: bool) -> Result<()> {
-    let sessions = storage.scan_all()?;
+fn display_sessions(
+    storage: Storage,
+    count: usize,
+    first: bool,
+    source: Option<String>,
+) -> Result<()> {
+    let mut sessions = storage.scan_all()?;
+    if let Some(source) = source {
+        let platform: Platform = source.parse()?;
+        let slug = platform.slug();
+        sessions.retain(|session| session.source.as_deref() == Some(slug));
+    }
+    // Stable sorting preserves archive insertion order when timestamps are
+    // absent, while timestamped captured sessions are shown chronologically.
+    sessions.sort_by_key(|session| session.created_at);
     let len = sessions.len();
 
     let (start, end, desc) = if first {
@@ -226,7 +343,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
     };
 
     if let Ok(input) = serde_json::from_str::<ChatSessionInput>(&content) {
-        let session: ChatSessionV1 = input.into();
+        let session = with_ingestion_metadata(input.into(), "add", &file);
         storage.append_pending(session)?;
         println!("Session saved to {}", db_path.display());
         return Ok(());
@@ -252,7 +369,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
         for conv in conversations {
             match conv.try_into() {
                 Ok(session) => {
-                    sessions_to_import.push(session);
+                    sessions_to_import.push(with_ingestion_metadata(session, "add", &file));
                     pb.inc(1);
                 }
                 Err(e) => {
@@ -288,7 +405,7 @@ fn handle_add_file(storage: Storage, db_path: PathBuf, file: String) -> Result<(
 
             let mut sessions_to_import = Vec::with_capacity(count);
             for input in sessions {
-                sessions_to_import.push(input.into());
+                sessions_to_import.push(with_ingestion_metadata(input.into(), "add", &file));
                 pb.inc(1);
             }
 
@@ -380,20 +497,39 @@ fn handle_stats(db_path: PathBuf) -> Result<()> {
 }
 
 /// Handles the 'first' command
-fn handle_first(db_path: PathBuf, count: usize) -> Result<()> {
+fn handle_first(db_path: PathBuf, count: usize, source: Option<String>) -> Result<()> {
     let storage = Storage::new(db_path);
-    display_sessions(storage, count, true)
+    display_sessions(storage, count, true, source)
 }
 
 /// Handles the 'last' command
-fn handle_last(db_path: PathBuf, count: usize) -> Result<()> {
+fn handle_last(db_path: PathBuf, count: usize, source: Option<String>) -> Result<()> {
     let storage = Storage::new(db_path);
-    display_sessions(storage, count, false)
+    display_sessions(storage, count, false, source)
 }
 
 /// Handles the 'show' command
-fn handle_show(db_path: PathBuf, session_id: String) -> Result<()> {
+fn handle_show(db_path: PathBuf, session_id: Option<String>, diagnostics: bool) -> Result<()> {
     let storage = Storage::new(db_path);
+
+    if diagnostics {
+        let sessions = storage.scan_all()?;
+        let selected: Vec<&ChatSessionV1> = session_id
+            .as_deref()
+            .map(|id| sessions.iter().filter(|session| session.id == id).collect())
+            .unwrap_or_else(|| sessions.iter().collect());
+        for session in selected {
+            println!("Session: {}", session.id);
+            print_session_diagnostics(session);
+        }
+        return Ok(());
+    }
+
+    let Some(session_id) = session_id else {
+        return Err(anyhow::anyhow!(
+            "show requires a session ID unless --diagnostics is used"
+        ));
+    };
 
     match storage.get_session_by_id(&session_id)? {
         Some(session) => {
@@ -429,6 +565,121 @@ fn handle_show(db_path: PathBuf, session_id: String) -> Result<()> {
     Ok(())
 }
 
+fn print_session_diagnostics(session: &ChatSessionV1) {
+    let metadata = serde_json::from_str::<serde_json::Value>(&session.metadata_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    println!(
+        "  Source: {}",
+        session.source.as_deref().unwrap_or("unknown")
+    );
+    println!("  Model: {}", session.model.as_deref().unwrap_or("unknown"));
+    println!(
+        "  Created: {}",
+        session
+            .created_at
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
+    println!("  Messages: {}", session.messages.len());
+    for key in [
+        "importer",
+        "parser_version",
+        "ingest_time",
+        "capture_revision",
+        "duplicate_key",
+        "source_platform",
+        "source_path",
+        "source_session_id",
+        "records_read",
+        "visible_messages_extracted",
+        "records_skipped_by_reason",
+        "malformed_records",
+    ] {
+        if let Some(value) = metadata.get(key) {
+            println!("  {key}: {value}");
+        }
+    }
+}
+
+fn with_ingestion_metadata(
+    mut session: ChatSessionV1,
+    importer: &str,
+    source_path: &str,
+) -> ChatSessionV1 {
+    let mut metadata = serde_json::from_str::<serde_json::Value>(&session.metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert(
+        "importer".into(),
+        serde_json::Value::String(importer.into()),
+    );
+    metadata.insert(
+        "parser_version".into(),
+        serde_json::Value::String("ingest-v1".into()),
+    );
+    metadata.insert(
+        "ingest_time".into(),
+        serde_json::Value::Number(chrono::Utc::now().timestamp().max(0).into()),
+    );
+    metadata.insert(
+        "source_platform".into(),
+        serde_json::Value::String(session.source.clone().unwrap_or_else(|| "unknown".into())),
+    );
+    metadata.insert(
+        "source_path".into(),
+        serde_json::Value::String(
+            if source_path == "-" {
+                "unknown"
+            } else {
+                source_path
+            }
+            .into(),
+        ),
+    );
+    metadata
+        .entry("source_session_id")
+        .or_insert_with(|| serde_json::Value::String(session.id.clone()));
+    metadata.entry("records_read").or_insert_with(|| {
+        serde_json::Value::Number(serde_json::Number::from(session.messages.len() as u64))
+    });
+    metadata.insert(
+        "visible_messages_extracted".into(),
+        serde_json::Value::Number(serde_json::Number::from(session.messages.len() as u64)),
+    );
+    metadata
+        .entry("records_skipped_by_reason")
+        .or_insert_with(|| serde_json::json!({}));
+    metadata
+        .entry("malformed_records")
+        .or_insert_with(|| serde_json::Value::Number(0.into()));
+    session.metadata_json = serde_json::Value::Object(metadata).to_string();
+    session
+}
+
+fn handle_audit_provenance(db_path: PathBuf) -> Result<()> {
+    let storage = Storage::new(db_path);
+    let sessions = storage.scan_all()?;
+    let mut missing = 0usize;
+    for session in &sessions {
+        let metadata = serde_json::from_str::<serde_json::Value>(&session.metadata_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let provenance_path = metadata
+            .get("source_path")
+            .and_then(|value| value.as_str())
+            .filter(|path| *path != "unknown");
+        if provenance_path.is_none() {
+            missing += 1;
+            println!(
+                "{}: original source cannot be reconstructed from vault data",
+                session.id
+            );
+        }
+    }
+    println!("Untraceable sessions: {}", missing);
+    Ok(())
+}
+
 /// Handles the 'reindex' command
 fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     // `reindex` now calls `flush_pending`, which writes to the archive data
@@ -458,11 +709,8 @@ fn handle_reindex(db_path: PathBuf, yes: bool) -> Result<()> {
     // Block-count denominator: the existing index may be truncated /
     // out-of-sync, so `stats` would lie. A header-only scan of the data
     // file gives the real number cheaply (no decompression).
-    let total_blocks = match storage.count_archive_blocks() {
-        Ok(n) => n,
-        // No data yet — fall through to reindex, which will short-circuit.
-        Err(_) => 0,
-    };
+    // No data yet — fall through to reindex, which will short-circuit.
+    let total_blocks = storage.count_archive_blocks().unwrap_or_default();
     let pb = make_progress_bar(total_blocks);
 
     let result = storage.reindex_with_progress(|| {
@@ -559,6 +807,258 @@ fn handle_flush(db_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn handle_capture(db_path: PathBuf, command: CaptureCommands) -> Result<()> {
+    match command {
+        CaptureCommands::Run {
+            platform,
+            time,
+            dry_run,
+            verbose,
+            json: as_json,
+            settle,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let options = CaptureOptions {
+                platform,
+                time,
+                dry_run,
+                settle,
+                ..Default::default()
+            };
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let report = if verbose {
+                let mut observer = |event: capture::CaptureEvent| {
+                    match event {
+                        capture::CaptureEvent::DiscoveryStarted { pass, candidates } => {
+                            eprintln!("Capture pass {pass}: scanning {candidates} candidate(s)");
+                        }
+                        capture::CaptureEvent::Candidate {
+                            platform,
+                            path,
+                            outcome,
+                            reason,
+                            ..
+                        } => {
+                            eprintln!(
+                                "  [{platform}] {path} — {outcome}{}",
+                                reason
+                                    .as_deref()
+                                    .map(|reason| format!(" ({reason})"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                        capture::CaptureEvent::PassCompleted { pass } => {
+                            eprintln!("Capture pass {pass} complete");
+                        }
+                    }
+                    let _ = io::stderr().flush();
+                };
+                capture::run_with_observer(&db_path, &options, &mut observer)?
+            } else {
+                capture::run(&db_path, &options)?
+            };
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let platform_counts = report
+                    .discovered_by_platform
+                    .iter()
+                    .map(|(platform, count)| format!("{platform} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "Capture: discovered {}{}, stable {}, imported {}, unchanged {}, empty {}, unsupported {}, unstable {}, failed {}{}",
+                    report.discovered_files,
+                    if platform_counts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({platform_counts})")
+                    },
+                    report.stable_files,
+                    report.imported_sessions,
+                    report.skipped_unchanged,
+                    report.skipped_empty,
+                    report.skipped_unsupported,
+                    report.skipped_unstable,
+                    report.failed_files,
+                    if dry_run { " (dry-run)" } else { "" }
+                );
+                if report.skipped_unstable > 0 {
+                    println!(
+                        "{} file(s) await a second unchanged observation; the next unchanged run will import them.",
+                        report.skipped_unstable
+                    );
+                    println!("Re-run: {}", capture_rerun_command(platform));
+                    println!("Use --verbose to see candidate paths and reasons.");
+                }
+                println!(
+                    "Capture wrote {} logical session(s). Inspect with: cryo last --source {}",
+                    report.imported_sessions,
+                    if platform == Platform::All {
+                        "<platform>"
+                    } else {
+                        platform.slug()
+                    }
+                );
+            }
+        }
+        CaptureCommands::Install {
+            platform,
+            time,
+            dry_run,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let mut paths = capture::install_scheduler(&db_path, platform, &time, dry_run)?;
+            paths.extend(capture::install_hooks(platform, dry_run)?);
+            if dry_run {
+                println!("Would install nightly capture at {}", time);
+            } else {
+                println!("Nightly capture installed for {}", time);
+            }
+            for path in paths {
+                println!("  {}", path.display());
+            }
+        }
+        CaptureCommands::Status { json: as_json } => {
+            let state = capture::load_state(&db_path)?;
+            let installed = capture::scheduler_installed()?;
+            let hooks = capture::hook_statuses()?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "installed": installed,
+                        "last_run_at": state.last_run_at,
+                        "tracked_files": state.files.len(),
+                        "pending_hook_hints": state.pending_hooks.len(),
+                        "schedule": state.schedule.as_deref().unwrap_or("23:00"),
+                        "hooks": hooks
+                    }))?
+                );
+            } else {
+                println!(
+                    "Nightly capture: {}",
+                    if installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    }
+                );
+                println!(
+                    "Schedule:        {} local time",
+                    state.schedule.as_deref().unwrap_or("23:00")
+                );
+                println!("Tracked files:   {}", state.files.len());
+                println!("Pending hints:   {}", state.pending_hooks.len());
+                println!("Hooks:");
+                for hook in hooks {
+                    println!(
+                        "  {:<13} {} ({}){}",
+                        hook.platform,
+                        if hook.installed {
+                            "installed"
+                        } else {
+                            "missing"
+                        },
+                        hook.configuration_path,
+                        hook.reason
+                            .as_deref()
+                            .map(|reason| format!(" — {reason}"))
+                            .unwrap_or_default()
+                    );
+                }
+                if let Some(last_run) = state.last_run_at {
+                    println!("Last run:        {}", last_run);
+                }
+            }
+        }
+        CaptureCommands::Uninstall { dry_run } => {
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(CryoLock::acquire(&db_path, 5000)?)
+            };
+            let mut paths = capture::uninstall_scheduler(dry_run)?;
+            paths.extend(capture::uninstall_hooks(Platform::All, dry_run)?);
+            if !dry_run {
+                capture::clear_schedule(&db_path)?;
+            }
+            println!(
+                "{} nightly capture scheduler{}.",
+                if dry_run { "Would remove" } else { "Removed" },
+                if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({})",
+                        paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            );
+        }
+        CaptureCommands::Hint {
+            platform,
+            session_id,
+            path,
+            stdin,
+        } => {
+            let platform: Platform = platform.parse()?;
+            let (session_id, path) = if stdin {
+                let mut payload = String::new();
+                io::stdin().read_to_string(&mut payload)?;
+                let value = serde_json::from_str::<serde_json::Value>(&payload).unwrap_or_default();
+                let session_id = session_id.or_else(|| {
+                    value
+                        .get("session_id")
+                        .or_else(|| value.get("sessionId"))
+                        .or_else(|| value.get("conversation_id"))
+                        .or_else(|| value.get("conversationId"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+                let path = path.or_else(|| {
+                    value
+                        .get("transcript_path")
+                        .or_else(|| value.get("transcriptPath"))
+                        .or_else(|| value.get("transcript_pathname"))
+                        .or_else(|| value.get("path"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from)
+                });
+                (session_id, path)
+            } else {
+                (session_id, path)
+            };
+            capture::record_hook_hint(
+                &db_path,
+                HookHint {
+                    platform,
+                    session_id,
+                    path: path.map(|p| p.to_string_lossy().to_string()),
+                    seen_at: chrono::Utc::now().timestamp().max(0) as u64,
+                },
+            )?;
+            // Hook clients receive exactly one JSON result on stdout. Tracing
+            // is configured for stderr, so no transcript content is emitted.
+            println!("{{\"queued\":true}}");
+        }
+    }
+    Ok(())
+}
+
 /// Main entry point for the Cryo CLI.
 /// Handles command parsing and dispatching to appropriate storage operations.
 fn main() -> Result<()> {
@@ -580,6 +1080,7 @@ fn main() -> Result<()> {
 
     // 2. Dispatch
     match cli.command {
+        Commands::Capture { command } => handle_capture(db_path, command)?,
         Commands::Add { file, stream } => handle_add(db_path, file, stream)?,
         Commands::Flush => handle_flush(db_path)?,
         Commands::Search {
@@ -589,9 +1090,15 @@ fn main() -> Result<()> {
             json,
         } => handle_search(db_path, query, after, before, json)?,
         Commands::Stats => handle_stats(db_path)?,
-        Commands::First { count } => handle_first(db_path, count)?,
-        Commands::Last { count } => handle_last(db_path, count)?,
-        Commands::Show { session_id } => handle_show(db_path, session_id)?,
+        Commands::First { count, source } => handle_first(db_path, count, source)?,
+        Commands::Last { count, source } => handle_last(db_path, count, source)?,
+        Commands::Show {
+            session_id,
+            diagnostics,
+        } => handle_show(db_path, session_id, diagnostics)?,
+        Commands::Audit { command } => match command {
+            AuditCommands::Provenance => handle_audit_provenance(db_path)?,
+        },
         Commands::Reindex { yes } => handle_reindex(db_path, yes)?,
         Commands::Optimise { chunk_kb, yes } => handle_optimise(db_path, chunk_kb, yes)?,
     }

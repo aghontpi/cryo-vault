@@ -1,0 +1,3 @@
+{"sessionId":"copilot-fixture-1","timestamp":1700000002,"model":"copilot-model","role":"user","content":"Check the Windows installer"}
+{"sessionId":"copilot-fixture-1","role":"assistant","content":"The task identity must be queryable."}
+{"sessionId":"copilot-fixture-1","role":"tool","content":"schtasks /Query"}

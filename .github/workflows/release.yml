@@ -1,0 +1,265 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.3.0
+        required: true
+        type: string
+      stage:
+        description: Create or refresh a draft, or publish an existing reviewed draft
+        required: true
+        default: draft
+        type: choice
+        options: [draft, publish]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate branch, tag, version, and notes
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "Run this workflow from main; received $GITHUB_REF." >&2
+            exit 1
+          fi
+          tag="${{ inputs.tag }}"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "Tag $tag must match Cargo.toml version v$version." >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must be a stable SemVer value in vX.Y.Z form." >&2
+            exit 1
+          fi
+          bash scripts/extract-release-notes.sh "$tag" > release-notes.md
+          test -s release-notes.md
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Upload curated release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  validate-source:
+    name: Test the release commit
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo test
+      - run: ./scripts/capture-smoke-test.sh
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: arm64
+            extension: ''
+            builder: cargo
+          - label: macOS x64
+            runner: macos-14
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x64
+            extension: ''
+            builder: cargo
+          - label: Linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+            extension: ''
+            builder: zig
+          - label: Linux arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            extension: ''
+            builder: zig
+          - label: Windows x64
+            runner: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            platform: windows
+            arch: x64
+            extension: '.exe'
+            builder: zig
+          - label: Windows arm64
+            runner: ubuntu-latest
+            target: aarch64-pc-windows-gnullvm
+            platform: windows
+            arch: arm64
+            extension: '.exe'
+            builder: zig
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Zig
+        if: matrix.builder == 'zig'
+        uses: goto-bus-stop/setup-zig@v2
+      - name: Install cargo-zigbuild
+        if: matrix.builder == 'zig'
+        run: cargo install cargo-zigbuild --locked
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.builder }}" == zig ]]; then
+            cargo zigbuild --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+          version="${{ needs.validate.outputs.version }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-v$version-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-v$version-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+      - name: Upload release artifacts
+        id: upload_artifacts
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+      - name: Retry artifact upload
+        id: retry_upload_artifacts
+        if: steps.upload_artifacts.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}-retry
+          path: dist/
+          if-no-files-found: error
+      - name: Fail if artifact upload did not recover
+        if: steps.upload_artifacts.outcome == 'failure' && steps.retry_upload_artifacts.outcome == 'failure'
+        run: exit 1
+
+  assemble:
+    name: Assemble and checksum release assets
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 cryo-vault-* | sort > "SHA256SUMS-${{ inputs.tag }}.txt"
+          shasum -a 256 -c "SHA256SUMS-${{ inputs.tag }}.txt"
+      - name: Upload assembled release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+
+  draft:
+    name: Create or refresh draft release
+    if: inputs.stage == 'draft'
+    needs: [validate, validate-source, assemble]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Create or refresh the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-state.txt 2>/dev/null; then
+            if [[ "$(cat draft-state.txt)" != true ]]; then
+              echo "Refusing to replace an already published release: $TAG" >&2
+              exit 1
+            fi
+            gh release edit "$TAG" --title "$TAG — Automatic agent conversation capture" --notes-file release-notes/release-notes.md --draft
+          else
+            gh release create "$TAG" --target "$SHA" --title "$TAG — Automatic agent conversation capture" --notes-file release-notes/release-notes.md --draft
+          fi
+          gh release upload "$TAG" dist/* --clobber
+
+  publish:
+    name: Publish reviewed draft release
+    if: inputs.stage == 'publish'
+    needs: [validate, validate-source, assemble]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Verify and publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != true ]]; then
+            echo "A reviewed draft release is required before publishing $TAG." >&2
+            exit 1
+          fi
+          git fetch --tags origin
+          if [[ "$(git rev-list -n 1 "$TAG")" != "$SHA" ]]; then
+            echo "Tag $TAG does not point to the validated main commit." >&2
+            exit 1
+          fi
+          shasum -a 256 -c "dist/SHA256SUMS-$TAG.txt"
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --latest

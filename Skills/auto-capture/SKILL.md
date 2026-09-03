@@ -1,13 +1,38 @@
 ---
 name: Cryo Vault Auto-Capture (end-of-conversation archival)
 description: Standing instruction for any AI agent (Claude Code, GitHub Copilot, Antigravity, Cursor, etc.) to automatically archive every finished conversation into the Cryo Vault database. Read this once at the start of a session; act on it when the session ends.
-version: 0.1.0
+version: 0.3.0
 ---
 
 # Cryo Vault — Auto-Capture
 
+Cryo Vault v0.3.0 also runs a local, default-on collector at 23:00 when the
+platform installer is used. `cryo capture install` installs marked,
+non-blocking lifecycle hooks for Claude Code, Cursor, Gemini CLI, Antigravity,
+and GitHub Copilot CLI; each hook only enqueues a lightweight JSON hint
+(`cryo capture hint --stdin`). Claude and Gemini retain their nested
+`SessionEnd` groups, Cursor uses a direct `hooks.sessionEnd` command, Copilot
+uses an `agentStop` hook in `~/.copilot/hooks/cryo-vault.json`, and Antigravity
+uses a named `Stop` hook in `~/.gemini/config/hooks.json`. Codex remains
+scanner-only. Parsing and
+database writes belong to the scheduled collector. Users can opt out with the
+installer flag `--no-capture` / `-NoCapture` or remove the schedule with
+`cryo capture uninstall`.
+
 At the **end of every conversation**, archive the session to Cryo Vault so it
 becomes searchable later via `cryo search` or the `cryo-vault` MCP server.
+
+When the local v0.3.0 scheduler is enabled, lifecycle hooks remain
+non-blocking: they enqueue `cryo capture hint --platform <platform> --stdin`
+and leave transcript parsing and database writes to the 23:00 collector. Manual
+MCP/CLI archival remains useful for clients without a discoverable local
+transcript.
+
+The collector is local-only. It reads supported transcript files from the user
+profile and writes the local Cryo Vault database; it does not upload
+transcripts. Hints are durable independent queue records, not a shared journal,
+and unrelated client configuration is preserved. Uninstall removes only the
+Cryo Vault scheduler and marked hooks; it retains the archive and user hooks.
 
 This file is the canonical source of truth. The installer
 (`install-agent-rules.sh` / `.ps1`) drops a short pointer to it into the

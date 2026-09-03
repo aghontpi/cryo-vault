@@ -2,6 +2,26 @@ use fastbloom::BloomFilter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+const SESSION_IDS_V2_PREFIX: &str = "v2:";
+
+/// Encode block session IDs without relying on a delimiter that can also be
+/// present in a user-provided session ID.
+pub fn encode_session_ids(session_ids: &[String]) -> String {
+    format!(
+        "{SESSION_IDS_V2_PREFIX}{}",
+        serde_json::to_string(session_ids).expect("session IDs are serializable")
+    )
+}
+
+/// Decode both the versioned representation and the legacy comma-separated
+/// representation written by older Cryo Vault versions.
+pub fn decode_session_ids(encoded: &str) -> Vec<String> {
+    encoded
+        .strip_prefix(SESSION_IDS_V2_PREFIX)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_else(|| encoded.split(',').map(str::to_string).collect())
+}
+
 /// Parameters for creating a `BlockIndex`.
 pub struct BlockIndexParams<'a> {
     /// Text content to be tokenized and indexed.
@@ -46,7 +66,7 @@ impl<'a> BlockIndexParams<'a> {
 }
 
 /// Represents the index for a single compressed block (session)
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BlockIndex {
     pub session_id: String,
     /// Byte offset in data file
@@ -80,7 +100,7 @@ impl BlockIndex {
             .map(|s| s.to_lowercase())
             .collect();
 
-        tokens.insert(session_id.clone());
+        tokens.extend(decode_session_ids(&session_id));
 
         let filter = BloomFilter::with_false_pos(0.05)
             .seed(&0x517CC1B727220A95_u128)

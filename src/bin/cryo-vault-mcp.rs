@@ -111,7 +111,7 @@ fn handle_request(req: JsonRpcRequest, storage: &Storage, db_path: &Path) -> Jso
                 "protocolVersion": "2024-11-05", // Spec version
                 "serverInfo": {
                     "name": "cryo-vault-mcp",
-                    "version": "0.1.0"
+                    "version": "0.3.0"
                 },
                 "capabilities": {
                     "tools": {}
@@ -390,7 +390,7 @@ fn error(id: Option<Value>, code: i32, message: String) -> JsonRpcResponse {
 fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
     // Try ChatSessionInput (Single Object)
     if let Ok(input) = serde_json::from_value::<ChatSessionInput>(content.clone()) {
-        let session: ChatSessionV1 = input.into();
+        let session = with_ingestion_metadata(input.into());
         storage.append_pending(session)?;
         return Ok("Session saved.".to_string());
     }
@@ -402,7 +402,7 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
             let mut sessions_to_import = Vec::with_capacity(count);
             for conv in conversations {
                 if let Ok(session) = conv.try_into() {
-                    sessions_to_import.push(session);
+                    sessions_to_import.push(with_ingestion_metadata(session));
                 }
             }
 
@@ -424,7 +424,7 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
             let count = sessions.len();
             let mut sessions_to_import = Vec::with_capacity(count);
             for input in sessions {
-                sessions_to_import.push(input.into());
+                sessions_to_import.push(with_ingestion_metadata(input.into()));
             }
             if count > 0 {
                 storage.append_bulk(sessions_to_import)?;
@@ -435,6 +435,41 @@ fn ingest_content(storage: &Storage, content: Value) -> Result<String> {
             "Failed to parse input as Session, ChatGPT Export, or Session Array."
         )),
     }
+}
+
+fn with_ingestion_metadata(mut session: ChatSessionV1) -> ChatSessionV1 {
+    let mut metadata = serde_json::from_str::<Value>(&session.metadata_json)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert("importer".into(), Value::String("mcp".into()));
+    metadata.insert("parser_version".into(), Value::String("ingest-v1".into()));
+    metadata.insert(
+        "ingest_time".into(),
+        Value::Number(chrono::Utc::now().timestamp().max(0).into()),
+    );
+    metadata.insert(
+        "source_platform".into(),
+        Value::String(session.source.clone().unwrap_or_else(|| "unknown".into())),
+    );
+    metadata
+        .entry("source_path")
+        .or_insert_with(|| Value::String("unknown".into()));
+    metadata
+        .entry("source_session_id")
+        .or_insert_with(|| Value::String(session.id.clone()));
+    metadata.insert(
+        "records_read".into(),
+        Value::Number((session.messages.len() as u64).into()),
+    );
+    metadata.insert(
+        "visible_messages_extracted".into(),
+        Value::Number((session.messages.len() as u64).into()),
+    );
+    metadata.insert("records_skipped_by_reason".into(), json!({}));
+    metadata.insert("malformed_records".into(), Value::Number(0.into()));
+    session.metadata_json = Value::Object(metadata).to_string();
+    session
 }
 
 /// Retrieves the most recent N sessions from storage.

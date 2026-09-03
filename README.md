@@ -52,7 +52,7 @@ The installer is idempotent: re-running it upgrades to the latest version and re
 
 | Flag (bash / pwsh) | Purpose |
 | :--- | :--- |
-| `--version v0.2.0` / `-Version v0.2.0` | Pin a specific release. |
+| `--version v0.3.0` / `-Version v0.3.0` | Pin a specific release. |
 | `--prefix <path>` / `-Prefix <path>` | Change the install location (default `~/.cryo-vault`). |
 | `--source local\|github` / `-Source local\|github` | Force the binary source. Auto-detects `dist/` when run from a clone. |
 | `--force` / `-Force` | Reinstall even if the same version is already present. |
@@ -75,6 +75,25 @@ cargo build --release
 > For convenience, alias the CLI binary:
 > `alias cryo="./target/release/cryo-vault"`
 
+### 3. Releases
+
+Release binaries are built by GitHub Actions from the reviewed `main` commit,
+not from a developer workstation. Pull requests produce retained build artifacts
+for all supported desktop targets. Stable releases use a two-step manual flow:
+
+1. Run **Prepare release** from `main` with a `vX.Y.Z` tag and the `draft`
+   stage. It validates the tag against `Cargo.toml`, builds all release binaries,
+   attaches them with `SHA256SUMS-vX.Y.Z.txt`, and creates or refreshes a draft.
+2. Review the draft notes and assets, then run the same workflow with the
+   `publish` stage. Publishing requires the repository's protected `release`
+   environment approval.
+
+Verify downloaded binaries from a release with:
+
+```bash
+shasum -a 256 -c SHA256SUMS-vX.Y.Z.txt
+```
+
 ---
 
 ## Usage Guide
@@ -94,17 +113,124 @@ Use the `cryo-vault` binary to manage your database manually.
 # This is useful for scripts or quick manual logging.
 ```
 
-#### Core Commands Overview (Upgraded in v0.2.0)
-Cryo Vault v0.2.0 includes major architecture upgrades to support high-density block storage, unified query pipelines, and backward compatibility.
+#### Core Commands Overview (v0.3.0)
+Cryo Vault v0.3.0 adds default-on nightly local capture while retaining the v0.2.0 storage and query compatibility upgrades.
 
-| Command | Usage | Description | v0.2.0 Upgrades |
+| Command | Usage | Description | Notes |
 | :--- | :--- | :--- | :--- |
 | **`add`** | `cryo add [file]` | Ingests a new single session or bulk array. | Can run via stdin (`-`) or with `--stream` flag for event-driven logs. |
 | **`flush`** | `cryo flush` | Manually flushes completed sessions from the WAL buffer to the active data segment. | **Upgraded**: Now packs pending sessions into optimized, highly compressed blocks (`StoredSession::Block`) rather than loose individual sessions to reduce fragmentation. |
 | **`search`** | `cryo search <query>` | Searches conversation history using indexes and Bloom filters. Supports `--after` and `--before` date/timestamp constraints. | **Upgraded**: Automatically and transparently detects and searches across all block storage versions (V1 single-session, new WAL Block, and legacy V2 compacted blocks) with zero user intervention. |
 | **`show`** | `cryo show <session_id>` | Displays full conversation details and metadata for a specific session ID. | **Upgraded**: Auto-detects and extracts the session from any block format on disk (V1, Block, or legacy V2) with zero overhead. |
 | **`stats`** | `cryo stats` | Computes comprehensive database diagnostics and statistics across all segments. | **Upgraded**: Aggregates diagnostics seamlessly across all block versions (V1, Block, legacy V2), showing accurate session counts, message counts, time ranges, and size. |
-| **`optimise`** | `cryo optimise` | Compacts all segments into dense blocks (default target: ~256KB) for fast search and lower memory. | Uses high-speed Zstd level 1 trial-compression for $O(1)$ pack calculation, and writes to `StoredSession::Block`. |
+| **`optimise`** | `cryo optimise` | Compacts all segments into dense blocks (default target: ~256KB) for fast search and lower memory. | Uses Zstd level 19 consistently for sizing and output, and writes to `StoredSession::Block`. |
+| **`capture`** | `cryo capture run` | Discovers and archives local transcripts from supported coding agents. | Stable-file gating, resumable session IDs, source fingerprints, and latest-revision semantics. |
+
+#### Nightly cross-platform capture
+
+The v0.3.0 installer enables a local 23:00 capture job by default. It scans
+local transcript files for Codex, Claude Code, GitHub Copilot CLI, Cursor,
+Gemini CLI, and Google Antigravity. Visible user, model, system, and relevant
+tool context is retained; hidden reasoning, internal progress, and client UI
+noise are omitted. The installer also registers marked, short-lived lifecycle
+hooks for Claude Code, Cursor, Gemini CLI, Antigravity, and Copilot CLI. Those
+hooks only enqueue a transcript path/session identifier; the nightly process
+does the parsing and archive write. Codex is scanner-only. Existing `cryo add`
+JSON and ChatGPT-export imports remain available as the generic fallback.
+
+```bash
+cryo capture run                         # capture all supported clients
+cryo capture run --platform claude-code  # capture one client
+cryo capture run --platform generic      # scan only CRYO_CAPTURE_IMPORT_ROOTS
+cryo capture run --dry-run               # inspect without writing
+cryo capture run --verbose               # print each candidate path and outcome
+cryo capture run --json                  # emit counters and safe candidate diagnostics
+cryo capture run --settle 2s              # re-observe unchanged files in this run
+cryo capture status
+cryo capture install --time 23:00
+cryo capture uninstall                   # removes the schedule, not the archive
+```
+
+For a manual import of a static transcript, point the generic scanner at a
+temporary or chosen import directory and use a settled run. The settled run
+keeps the database lock while it waits and performs the second unchanged
+observation, so it can import a file in one command:
+
+```bash
+export CRYO_CAPTURE_IMPORT_ROOTS="$PWD/my-transcripts"
+cryo capture run --platform generic --settle 1s --verbose
+cryo search "a phrase from the transcript"
+```
+
+The `--platform` flag can narrow a scan to `codex`, `claude-code`, `copilot-cli`,
+`cursor`, `gemini-cli`, `antigravity`, or `generic`. A normal run never waits:
+the first observation is recorded and the next unchanged run imports the file.
+If that happens, the command prints the exact rerun command; use `--verbose` to
+see the paths and safe reasons. `--json` includes the same aggregate counters,
+per-platform discovery counts, and candidate outcomes, but never transcript
+message text.
+
+Capture is duplicate-safe by default: an unchanged source session (or a
+transcript with the same visible-content fingerprint when no source ID exists)
+is reported as `unchanged` with reason `duplicate already archived`, even after
+the state file is removed or a transcript is moved. Candidate reasons include
+`empty transcript`, `unsupported source record`, `no visible conversation
+records`, and `malformed transcript`.
+`first` and `last` use visible session timestamps and accept `--source
+<platform>` filters. Use `cryo show --diagnostics` for provenance and
+extraction metrics, or `cryo audit provenance` to find legacy sessions whose
+original source cannot be reconstructed.
+
+The repository includes a self-contained smoke test that uses only a temporary
+database and generic transcript root. It expects a built CLI binary (or the
+`CRYO_BIN` override):
+
+```bash
+cargo build
+./scripts/capture-smoke-test.sh
+```
+
+The nightly scheduler remains a single, non-waiting observation pass. Use
+`--settle` explicitly for manual runs or tests when waiting for a second
+observation is appropriate.
+
+Capture state is stored under the database directory in `capture-state.json`;
+end-of-session hints are first written as independent JSON records in the
+`capture-hints/` queue. The collector merges and deduplicates that queue while
+holding the database lock, then removes only records represented by the saved
+state (and migrates the old `capture-hooks.jsonl` journal once). A source path,
+platform session identifier, visible content fingerprint, and last-seen
+timestamp are recorded as metadata. When a transcript is resumed, the same
+stable ID receives a new revision and all search, show, stats, and reindex
+operations expose the latest revision only.
+Files that are still changing are deferred until a later run: a file must be
+observed identically twice, unless a valid lifecycle hint supplies its concrete
+path. Generic scheduled capture is disabled unless
+`CRYO_CAPTURE_IMPORT_ROOTS` explicitly names one or more import roots. The
+The native hook locations and formats are client-specific: Claude Code keeps a
+nested `SessionEnd` hook in `~/.claude/settings.json`; Cursor uses a direct
+`hooks.sessionEnd` command in `~/.cursor/hooks.json`; Gemini CLI keeps a nested
+`SessionEnd` hook with a 2000 ms timeout in `~/.gemini/settings.json`; Copilot
+CLI uses an `agentStop` hook in `~/.copilot/hooks/cryo-vault.json` with its Unix
+`bash` or Windows `powershell` field and a 2-second timeout; and Antigravity
+uses a named `Stop` hook in `~/.gemini/config/hooks.json`. Antigravity transcript discovery reads
+`~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript.jsonl`,
+with the old `antigravity-ide` and `antigravity` roots retained as read-only
+fallbacks. Antigravity's system-generated event records are parsed into visible
+user, model, and tool turns; damaged JSONL lines are skipped when valid turns
+surround them. A system-only file is reported as `no visible conversation
+records`; `malformed transcript` means that no usable records could be
+recovered. History, cache, settings, database files, and `transcript_full.jsonl`
+are excluded. The installer preserves unrelated hook configuration and removes
+only Cryo Vault entries.
+
+Privacy is local-only: Cryo Vault reads supported files from the local user
+profile and writes only to the configured local database. It does not upload
+transcripts. To stop collection, run `cryo capture uninstall`; this retains the
+archive. To remove it, use the exact path you configured with `--db` or
+`CRYO_DB_PATH` and verify that path before deleting it; do not infer a path from
+an unset environment variable. The platform installers accept
+`--no-capture` / `-NoCapture` as an explicit opt-out.
 
 ## JSON Structure & Parameters Information
 
@@ -252,7 +378,7 @@ Over time, appending loose sessions or streaming logs via the WAL can result in 
 #### How Compaction Works
 - **Consolidated Archival**: It reads all sessions from the active database segment and flushes the Write-Ahead Log (WAL) buffer to ensure all recent activity is included.
 - **Two-Phase High-Speed Compression**:
-  - The packer loop performs a rapid size check by serializing and trial-compressing the growing chunk using **Zstd Level 1** (which is 100x to 500x faster than level 19, running in fractions of a millisecond).
+  - The packer loop uses a cheap raw-size gate before trial-compressing the growing chunk with the same **Zstd Level 19** settings used for the final block.
   - Once the target size limit is triggered, the packer seals the block and compresses it at **Zstd Level 19 exactly once** prior to writing it to disk.
   - This reduces the number of Level 19 compressions from $O(N^2)$ to exactly $O(1)$ per block, resulting in a **10x to 100x execution speedup** while preserving maximum storage efficiency.
 - **Backwards Compatibility**: Compressed blocks are serialized as `StoredSession::Block`, which remains fully queryable and backwards-compatible with standard query pipelines.

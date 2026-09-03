@@ -1,0 +1,3 @@
+{"source":"SYSTEM","type":"CONFIGURATION","timestamp":1700000020,"content":"internal configuration"}
+{"source":"SYSTEM","type":"CHECKPOINT","timestamp":1700000021,"content":"internal checkpoint"}
+{"source":"MODEL","type":"PLANNER_RESPONSE","timestamp":1700000022,"content":"","tool_calls":[]}

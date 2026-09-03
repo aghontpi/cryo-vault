@@ -225,6 +225,24 @@ fn test_add_log_search_and_read() -> Result<()> {
 
     assert_eq!(session["id"], session_id);
     assert_eq!(session["messages"].as_array().unwrap().len(), 2);
+    let metadata: Value = serde_json::from_str(session["metadata_json"].as_str().unwrap())?;
+    assert_eq!(metadata["importer"], "mcp");
+    for field in [
+        "parser_version",
+        "ingest_time",
+        "source_platform",
+        "source_path",
+        "source_session_id",
+        "records_read",
+        "visible_messages_extracted",
+        "records_skipped_by_reason",
+        "malformed_records",
+    ] {
+        assert!(
+            !metadata[field].is_null(),
+            "missing metadata field: {field}"
+        );
+    }
 
     Ok(())
 }

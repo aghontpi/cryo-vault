@@ -134,14 +134,14 @@ pub enum MessageRole {
     Tool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: String,
     pub id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     pub tool_call_id: Option<String>,
     pub content: String,

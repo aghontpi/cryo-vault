@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -9,6 +10,344 @@ fn cryo_command(db_path: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cryo-vault"));
     cmd.env("CRYO_DB_PATH", db_path);
     cmd
+}
+
+#[test]
+fn test_cli_capture_run_and_idempotency() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join(".cryo-vault/imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    std::fs::write(
+        import_root.join("session.json"),
+        r#"{"session_id":"capture-one","messages":[{"role":"user","content":"capture me"},{"role":"assistant","content":"done"}]}"#,
+    )
+    .unwrap();
+
+    cryo_command(&db_path)
+        .env("HOME", temp_dir.path())
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unstable 1"));
+
+    cryo_command(&db_path)
+        .env("HOME", temp_dir.path())
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("imported 1"));
+
+    cryo_command(&db_path)
+        .arg("search")
+        .arg("capture me")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capture-generic-"));
+}
+
+#[test]
+fn test_cli_capture_verbose_first_pass_guidance_is_safe() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = import_root.join("pending.json");
+    std::fs::write(
+        &transcript,
+        r#"{"session_id":"pending","messages":[{"role":"user","content":"private transcript body"}]}"#,
+    )
+    .unwrap();
+
+    cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unstable 1"));
+
+    let output = cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args([
+            "capture",
+            "run",
+            "--platform",
+            "generic",
+            "--settle",
+            "0s",
+            "-v",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("Capture:"));
+    assert!(!stdout.contains(transcript.to_str().unwrap()));
+    assert!(!stdout.contains("— imported"));
+    assert!(!stdout.contains("private transcript body"));
+    assert_eq!(stderr.matches(transcript.to_str().unwrap()).count(), 1);
+    assert!(stderr.contains("imported"));
+}
+
+#[test]
+fn test_cli_capture_no_session_id_deduplicates_across_paths_and_state_reset() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = r#"{"messages":[{"role":"user","content":"same visible transcript"},{"role":"assistant","content":"same answer"}]}"#;
+    std::fs::write(import_root.join("one.json"), transcript).unwrap();
+    std::fs::write(import_root.join("two.json"), transcript).unwrap();
+
+    let first = cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args([
+            "capture",
+            "run",
+            "--platform",
+            "generic",
+            "--settle",
+            "0s",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let report: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(report["imported_sessions"], 1);
+
+    std::fs::remove_file(db_path.join("capture-state.json")).unwrap();
+    let second = cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args([
+            "capture",
+            "run",
+            "--platform",
+            "generic",
+            "--settle",
+            "0s",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let report: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(report["imported_sessions"], 0);
+
+    cryo_command(&db_path)
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total Sessions:   1"));
+}
+
+#[test]
+fn test_cli_capture_changed_no_session_id_keeps_one_latest_revision() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = import_root.join("revisable.json");
+    std::fs::write(
+        &transcript,
+        r#"{"messages":[{"role":"user","content":"old visible text"}]}"#,
+    )
+    .unwrap();
+
+    for expected in [1, 1] {
+        let output = cryo_command(&db_path)
+            .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+            .args([
+                "capture",
+                "run",
+                "--platform",
+                "generic",
+                "--settle",
+                "0s",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["imported_sessions"], expected);
+        if expected == 1 {
+            std::fs::write(
+                &transcript,
+                r#"{"messages":[{"role":"user","content":"new visible text"}]}"#,
+            )
+            .unwrap();
+        }
+    }
+
+    cryo_command(&db_path)
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total Sessions:   1"));
+    cryo_command(&db_path)
+        .args(["show", "--diagnostics"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capture_revision: 2"))
+        .stdout(predicate::str::contains("new visible text").not());
+    cryo_command(&db_path)
+        .args(["search", "new visible text"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capture-generic-"));
+    cryo_command(&db_path)
+        .args(["search", "old visible text"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No matches found"));
+}
+
+#[test]
+fn test_cli_capture_reimports_reverted_no_session_id_revision() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = import_root.join("revertible.json");
+
+    for content in ["revision A", "revision B", "revision A"] {
+        std::fs::write(
+            &transcript,
+            format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}]}}"#),
+        )
+        .unwrap();
+        let output = cryo_command(&db_path)
+            .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+            .args([
+                "capture",
+                "run",
+                "--platform",
+                "generic",
+                "--settle",
+                "0s",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["imported_sessions"], 1, "{content}");
+    }
+
+    cryo_command(&db_path)
+        .arg("stats")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Total Sessions:   1"));
+}
+
+#[test]
+fn test_cli_capture_json_settle_imports_without_transcript_content() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    std::fs::write(
+        import_root.join("settled.json"),
+        r#"{"session_id":"settled","messages":[{"role":"user","content":"do not print this transcript"}]}"#,
+    )
+    .unwrap();
+
+    let output = cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args([
+            "capture",
+            "run",
+            "--platform",
+            "generic",
+            "--settle",
+            "0s",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["imported_sessions"], 1);
+    assert_eq!(report["discovered_by_platform"]["generic"], 1);
+    assert_eq!(report["candidates"][0]["outcome"], "imported");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("do not print this transcript"));
+}
+
+#[test]
+fn test_cli_capture_malformed_file_is_named_on_stderr() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    let import_root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&import_root).unwrap();
+    let transcript = import_root.join("malformed.json");
+    std::fs::write(&transcript, "not valid json").unwrap();
+
+    let output = cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &import_root)
+        .args([
+            "capture",
+            "run",
+            "--platform",
+            "generic",
+            "--settle",
+            "0s",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["failed_files"], 1);
+    assert_eq!(report["candidates"][0]["outcome"], "failed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(transcript.to_str().unwrap()));
+    assert!(String::from_utf8_lossy(&output.stdout).contains(transcript.to_str().unwrap()));
+}
+
+#[test]
+fn test_cli_capture_scheduler_dry_run_and_time_validation() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+
+    cryo_command(&db_path)
+        .args(["capture", "install", "--time", "01:15", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("01:15"));
+
+    cryo_command(&db_path)
+        .args(["capture", "install", "--time", "25:00", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("capture time must be HH:MM"));
+}
+
+#[test]
+fn test_cli_capture_hint_queues_only_json_result() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+
+    cryo_command(&db_path)
+        .args(["capture", "hint", "--platform", "antigravity", "--stdin"])
+        .write_stdin(
+            r#"{"conversationId":"conversation-1","transcriptPath":"/tmp/transcript.jsonl"}"#,
+        )
+        .assert()
+        .success()
+        .stdout("{\"queued\":true}\n")
+        .stderr(predicate::str::is_empty());
+
+    assert!(!db_path.join("capture-state.json").exists());
+    assert_eq!(
+        std::fs::read_dir(db_path.join("capture-hints"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
 /// Tests that the `stats` command works correctly on an empty database.
@@ -75,6 +414,18 @@ fn test_cli_add_and_search() {
         .assert()
         .success()
         .stdout(predicate::str::contains("[s1] CLI Test"));
+
+    cryo_command(&db_path)
+        .args(["show", "s1", "--diagnostics"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("importer: \"add\""))
+        .stdout(predicate::str::contains("source_path: \"unknown\""))
+        .stdout(predicate::str::contains("source_session_id: \"s1\""))
+        .stdout(predicate::str::contains("records_read:"))
+        .stdout(predicate::str::contains("visible_messages_extracted:"))
+        .stdout(predicate::str::contains("records_skipped_by_reason:"))
+        .stdout(predicate::str::contains("malformed_records:"));
 }
 
 /// Tests adding sessions via the streaming interface.
@@ -107,6 +458,16 @@ fn test_cli_add_stream() {
         .assert()
         .success()
         .stdout(predicate::str::contains("[ws1] Untitled")); // No title in stream
+
+    cryo_command(&db_path)
+        .args(["show", "ws1", "--diagnostics"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("importer: \"stream\""))
+        .stdout(predicate::str::contains("parser_version:"))
+        .stdout(predicate::str::contains("source_platform: \"unknown\""))
+        .stdout(predicate::str::contains("source_path: \"unknown\""))
+        .stdout(predicate::str::contains("source_session_id: \"ws1\""));
 }
 
 /// Tests the `show` command to display a specific session by ID.
@@ -176,6 +537,59 @@ fn test_cli_first_last() {
         .assert()
         .success()
         .stdout(predicate::str::contains("last 2"));
+}
+
+#[test]
+fn test_cli_first_last_source_filter_is_chronological() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    for (id, source, created_at) in [
+        ("old-codex", "codex", 1_700_000_001),
+        ("middle-claude", "claude-code", 1_700_000_002),
+        ("new-codex", "codex", 1_700_000_003),
+    ] {
+        cryo_command(&db_path)
+            .arg("add")
+            .write_stdin(format!(
+                r#"{{"id":"{id}","source":"{source}","created_at":{created_at},"messages":[]}}"#
+            ))
+            .assert()
+            .success();
+    }
+
+    cryo_command(&db_path)
+        .args(["first", "1", "--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old-codex"))
+        .stdout(predicate::str::contains("new-codex").not());
+    cryo_command(&db_path)
+        .args(["last", "1", "--source", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("new-codex"))
+        .stdout(predicate::str::contains("old-codex").not());
+}
+
+#[test]
+fn test_cli_audit_provenance_reports_source_less_legacy_session() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(".cryo");
+    cryo_command(&db_path)
+        .arg("add")
+        .write_stdin(r#"{"id":"legacy-session","messages":[]}"#)
+        .assert()
+        .success();
+
+    cryo_command(&db_path)
+        .args(["audit", "provenance"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("legacy-session"))
+        .stdout(predicate::str::contains(
+            "original source cannot be reconstructed",
+        ))
+        .stdout(predicate::str::contains("Untraceable sessions: 1"));
 }
 
 /// Tests the `reindex` command to rebuild the search index.
