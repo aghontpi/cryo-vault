@@ -243,6 +243,21 @@ jobs:
         with:
           name: release-bundle
           path: dist
+          merge-multiple: true
+      - name: Normalize and validate release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' asset; do
+            name="$(basename "$asset")"
+            [[ "$asset" == "dist/$name" ]] || cp "$asset" "dist/$name"
+          done < <(find dist -type f -name 'cryo-vault-*' -print0)
+          mapfile -t binaries < <(find dist -maxdepth 1 -type f -name 'cryo-vault-*' -print)
+          if [[ "${#binaries[@]}" -ne 12 ]]; then
+            echo "Expected 12 release binaries in dist; found ${#binaries[@]}." >&2
+            find dist -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
       - name: Verify and publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
