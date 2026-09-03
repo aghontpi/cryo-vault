@@ -275,6 +275,9 @@ jobs:
             echo "Draft release $TAG does not target the validated main commit." >&2
             exit 1
           fi
-          shasum -a 256 -c "dist/SHA256SUMS-$TAG.txt"
+          (
+            cd dist
+            shasum -a 256 -c "SHA256SUMS-$TAG.txt"
+          )
           gh release upload "$TAG" dist/* --clobber
           gh release edit "$TAG" --draft=false --latest
