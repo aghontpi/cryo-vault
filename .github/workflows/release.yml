@@ -255,9 +255,9 @@ jobs:
             echo "A reviewed draft release is required before publishing $TAG." >&2
             exit 1
           fi
-          git fetch --tags origin
-          if [[ "$(git rev-list -n 1 "$TAG")" != "$SHA" ]]; then
-            echo "Tag $TAG does not point to the validated main commit." >&2
+          draft_sha="$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish)"
+          if [[ "$draft_sha" != "$SHA" ]]; then
+            echo "Draft release $TAG does not target the validated main commit." >&2
             exit 1
           fi
           shasum -a 256 -c "dist/SHA256SUMS-$TAG.txt"
