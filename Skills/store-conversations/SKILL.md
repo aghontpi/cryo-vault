@@ -1,226 +1,139 @@
 ---
 name: Cryo Vault CLI Interaction & Log Ingestion
-description: Use this skill when asked to add/ingest new logs, flush or compact the database, or when asked to check history, search past chat logs, or retrieve previous conversations from the Cryo Vault database.
-version: 0.2.0
+description: Use this skill to import logs, run capture, flush or compact the database, search history, inspect provenance, or retrieve conversations from Cryo Vault.
+version: 0.3.0
 ---
 
-# Cryo Vault CLI (v0.2.0)
+# Cryo Vault CLI
 
-This skill allows you to interact with the Cryo Vault database using its native command-line interface. You can ingest logs, search conversations, compact storage, and view statistics directly from the terminal.
+The installer provides the `cryo` command. From a source checkout, build with
+`cargo build --release` and use `target/release/cryo-vault`, or alias it as
+`cryo`. The database defaults to `~/.cryo`; override it with `--db` or
+`CRYO_DB_PATH`. `RUST_LOG` controls diagnostic logging and defaults to `warn`.
 
-v0.2.0 adds two new pieces of surface area and upgrades the existing ones — see [Notes for v0.2.0](#notes-for-v020) at the bottom for what changed and how it affects day-to-day use.
+## Automatic capture
 
-## Setup
-
-The recommended path is the installer (drops the `cryo` command on `PATH` and removes any older version it finds):
-
-```bash
-./install.sh          # macOS / Linux
-./install.ps1         # Windows (PowerShell)
-```
-
-Or build from source:
+The platform installer enables a local 23:00 collector unless the user passes
+`--no-capture` / `-NoCapture`. Use the [capture runbook](../../README.md#automatic-capture-runbook)
+for the scheduler, hooks, platform filters, dry runs, and settle-time behavior.
 
 ```bash
-cargo build --release
+cryo capture run
+cryo capture run --platform claude-code --verbose
+cryo capture run --dry-run --json
+cryo capture run --settle 1s
+cryo capture status
+cryo capture install --time 23:00
+cryo capture uninstall
 ```
 
-- CLI binary: `target/release/cryo-vault`
-- MCP server binary: `target/release/cryo-vault-mcp`
-
-**Alias for convenience (when not using the installer):**
-```bash
-alias cryo="./target/release/cryo-vault"
-```
-
-After install you can invoke `cryo` directly from any terminal.
-
-## Environment Variables
-
-- `CRYO_DB_PATH`: Path to the database directory. Defaults to `~/.cryo`.
-- `RUST_LOG`: Control logging verbosity (`error`, `warn`, `info`, `debug`, `trace`). Default is `warn`.
+Codex is scanner-only. Claude Code, Cursor, Gemini CLI, GitHub Copilot CLI,
+and Antigravity can enqueue non-blocking lifecycle hints. Generic transcript
+roots are opt-in through `CRYO_CAPTURE_IMPORT_ROOTS`. If native capture can
+discover a transcript, do not archive the same conversation manually as well.
+Use `cryo add` or MCP `add_log` when a transcript is not discoverable or an
+immediate import is explicitly wanted.
 
 ## Commands
 
-### 1. Ingest data (`add`)
-
-Ingest chat logs from a file or standard input.
+### Import (`add`)
 
 ```bash
 cryo add [OPTIONS] [FILE]
+cryo add conversation.json
+cat conversation.json | cryo add -
+cryo add --stream events.jsonl
 ```
 
-**Arguments**
-- `FILE`: Path to the input file. Use `-` for stdin (default).
+Input may be one `ChatSessionInput` object, an array of sessions, a ChatGPT
+export, or newline-delimited streaming events. Always include a specific
+3–7-word `title` in explicit ingests. Valid roles are `user`, `model`,
+`system`, `thought`, and `tool`.
 
-**Options**
-- `--stream`: Treat input as streaming output (one JSON object per line).
-
-**Supported formats**
-- Single session: a `ChatSessionInput` JSON object.
-- List of sessions: an array `[ ... ]` of `ChatSessionInput` objects.
-- ChatGPT export: JSON exported from ChatGPT (list of conversations).
-
-```bash
-# Import a single file
-cryo add my_chat_logs.json
-
-# Import from stdin
-cat logs.json | cryo add -
-
-# Import streaming newline-delimited JSON
-tail -f live_logs.jsonl | cryo add --stream -
-```
-
-**Always set `title` when ingesting.** The field is optional in the wire
-format for backwards compatibility, but `cryo last` / `cryo first` /
-`cryo search` print it as the human label for each session. Omitting it
-fills the archive with `Untitled` entries that no one can browse.
-
-When *you* (the model) ingest a session — whether via `cryo add` or the
-MCP `add_log` tool — include a 3–7 word summary in `title`:
-
-- Specific enough to find again with `cryo search`.
-- A *summary of what the session is about*, not a verbatim copy of the
-  first user message.
-- Sentence-case or lowercase, no trailing punctuation.
-- Good: `JWT auth refresh flow`, `Debug Nginx streaming proxy`,
-  `Migrate Postgres to RDS`.
-- Bad: `Untitled`, `Chat`, `Conversation`, `New chat`, `""`,
-  or pasting the user's literal first message.
-
-If the content genuinely resists a summary (a one-line lookup, a single
-test message), use a short topical phrase like `Quick lookup` or
-`One-off question` — never a placeholder.
-
-### 2. Flush the WAL (`flush`)
-
-Manually flush completed sessions from the Write-Ahead Log (`pending.bin`) into the active data segment.
+### Flush (`flush`)
 
 ```bash
 cryo flush
 ```
 
-In v0.2.0 this no longer writes loose single sessions — pending sessions are packed into a single highly compressed `StoredSession::Block` per flush, so you get dense storage even without running `optimise`.
+Reconstructs finalized sessions from `pending.bin`, skips exact replays, and
+appends a `StoredSession::V1` for one session or `StoredSession::Block` for
+multiple sessions. Unfinished WAL events remain pending.
 
-### 3. Search (`search`)
-
-Search the archive for conversations matching a query.
-
-```bash
-cryo search [OPTIONS] <QUERY>
-```
-
-**Arguments**
-- `QUERY`: The search term (regex supported).
-
-**Options**
-- `--after <DATE>`: Filter by date (YYYY-MM-DD or Unix timestamp).
-- `--before <DATE>`: Filter by date (YYYY-MM-DD or Unix timestamp).
-- `--json`: Output results as raw JSON.
+### Search (`search`)
 
 ```bash
-# Simple search
 cryo search "rust optimization"
-
-# Date range
-cryo search "database" --after 2023-01-01 --before 2024-01-01
-
-# JSON for downstream processing
-cryo search "error" --json | jq .
+cryo search "database" --after 2025-01-01 --before 2025-12-31
+cryo search "error" --json
 ```
 
-`search` automatically reads every segment on disk (v0.2.0 fix) and transparently handles V1 single-session, new WAL Block, and legacy V2 compacted block formats. Time filters apply per session, not per block — sessions outside `--after`/`--before` are excluded even when they share a block with matches.
+Search scans all data/index segments, resolves each ID to its newest revision,
+uses time ranges and Bloom filters to prune blocks, then verifies matches after
+decoding the selected block. It supports regex queries and per-session time
+filters.
 
-### 4. View session (`show`)
-
-Show full details of a specific session by ID.
+### Show and browse
 
 ```bash
-cryo show <SESSION_ID>
+cryo show <session-id>
+cryo show <session-id> --diagnostics
+cryo first [COUNT]
+cryo last [COUNT] --source cursor
 ```
 
-```bash
-cryo show 550e8400-e29b-41d4-a716-446655440000
-```
+`show --diagnostics` displays provenance and extraction metrics instead of
+message bodies. `first` and `last` expose logical sessions and can filter by
+captured source platform.
 
-Auto-detects and extracts the session from any block format on disk (V1, Block, or legacy V2).
-
-### 5. Browse sessions
-
-```bash
-cryo last [COUNT]      # newest N sessions (default 10)
-cryo first [COUNT]     # oldest N sessions (default 10)
-```
-
-```bash
-cryo last 5
-```
-
-### 6. Statistics (`stats`)
+### Stats, compaction, and maintenance
 
 ```bash
 cryo stats
+cryo optimise --chunk-kb 256 --yes
+cryo reindex --yes
+cryo audit provenance
 ```
 
-Reports total sessions, messages, disk usage, and time range. v0.2.0 fixes the regression where `stats` was counting blocks instead of sessions — multi-session blocks are now expanded to real session counts across all segments.
+`stats` counts newest visible sessions and messages, while physical compressed
+and uncompressed bytes can include superseded revisions still on disk.
+`optimise` rewrites the active archive into dense Zstd level-19 blocks.
+`reindex` rebuilds indexes from all data segments and returns the logical
+visible count. `audit provenance` finds legacy sessions whose original source
+cannot be reconstructed.
 
-### 7. Compaction (`optimise`)
+## Input shape
 
-Compact loose sessions into dense, highly compressed blocks. Use this after a large import (e.g. a ChatGPT export) or periodically to keep storage tight and search fast.
-
-```bash
-cryo optimise [OPTIONS]
+```json
+{
+  "title": "Migrate Postgres to RDS",
+  "source": "manual-cli",
+  "model": "gpt-5",
+  "created_at": 1706123456,
+  "messages": [
+    { "role": "user", "content": "Plan the migration" },
+    { "role": "model", "content": "Start with a rehearsal..." }
+  ]
+}
 ```
 
-**Options**
+`id`, `title`, `source`, `model`, and `created_at` are optional for wire
+compatibility; `messages` defaults to an empty array. Extra session fields are
+stored as metadata. For explicit archives, titles remain strongly recommended
+because list and search output uses them as the human-readable label.
 
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--chunk-kb` | `usize` | `256` | Target compressed block size in KB. |
-| `--yes` | flag | – | Skip the interactive confirmation prompt. |
+## Storage semantics
 
-```bash
-# Default ~256 KB blocks
-cryo optimise
+Data is stored locally as `data_NNN.cryo` segments with parallel
+`index_NNN.cryo` files, a framed `pending.bin` WAL, and capture state under the
+database directory. Segments rotate at 1 GiB. Archive records use Zstd level
+19 and bincode `StoredSession::{V1, Block, V2}` compatibility wrappers.
 
-# Larger blocks (fewer files, slightly slower random access)
-cryo optimise --chunk-kb 512
+Writes are append-oriented. If a transcript resumes, the same stable capture ID
+receives a new revision; search, show, browse, stats, and reindex expose the
+latest revision while older physical records may remain until compaction.
+Indexes store IDs, offsets, sizes, message counts, time ranges, and Bloom
+filters. They accelerate reads but are rebuildable from data.
 
-# Non-interactive (cron / CI)
-cryo optimise --yes
-```
-
-v0.2.0 fixes three things here: blocks now actually hit `--chunk-kb` (the trial pass uses zstd level 19 like the real write), per-block cost drops from O(N²) to O(N) via a cheap raw-size pre-gate, and pending WAL entries are drained first so recent sessions are included.
-
-### 8. Maintenance (`reindex`)
-
-Rebuild the search index from the raw data files. Useful if the index becomes corrupted, you manually moved data files, or `stats` previously showed wrong counts on a v0.1.0 archive.
-
-```bash
-cryo reindex
-```
-
-v0.2.0: `reindex` now flushes pending into the archive under the same `CryoLock` used by `add` / `flush` / `optimise`, so a concurrent `cryo add` from another shell can't corrupt anything.
-
----
-
-## Notes for v0.2.0
-
-What changed that callers of this skill should know:
-
-- **`flush`** packs into a dense `StoredSession::Block` rather than writing loose sessions. No flag needed — this is the new default.
-- **`optimise`** is a new top-level command (compaction). Suggest it after bulk imports or when `stats` shows many small loose sessions.
-- **All read paths** (`search`, `show`, `last`, `first`, `stats`, `reindex`) are now multi-segment safe. On v0.1.0 archives larger than 1 GB they were silently ignoring `data_002.cryo` and later — if a user reports "I imported X but can't find it", run `cryo reindex` once on a v0.1.0 archive.
-- **`stats`** now reports real session counts, not block counts. If a user upgraded from v0.1.0 and `stats` looks wrong (e.g. `Sessions: 5` for an obviously larger archive), run `cryo reindex`.
-- **Concurrency**: CLI and MCP server now share the same `CryoLock` (5 s timeout). A `cryo add` from a shell while the MCP server is writing is safe in v0.2.0.
-- **Backwards compatibility**: No schema change. Existing `.cryo` files from v0.1.0 keep working — all three formats (V1 single-session, Block, legacy V2) are read transparently.
-
-## Quick decision guide
-
-- User says "import this export" → `cryo add <file>`, then suggest `cryo optimise --yes` if the file is large (>1000 sessions).
-- User says "find conversations about X" → `cryo search "X"` (add `--after` / `--before` if they give a timeframe).
-- User says "show me that session" → `cryo show <id>`.
-- User says "what's in my database" / "stats" → `cryo stats`.
-- User says "the database is slow" or "shrink the database" → `cryo optimise`.
-- User says "search isn't finding something I know is there" on a large or v0.1.0-era archive → `cryo reindex`.
+For component ownership and the exact capture/storage pipeline, read the
+[canonical architecture document](../../docs/architecture.md).

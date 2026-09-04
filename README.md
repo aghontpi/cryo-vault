@@ -1,160 +1,152 @@
 <div align="center">
 
-# Cryo Vault - Conversations Database
+# Cryo Vault
 
-A high-performance, highly compressed database for storing chat conversations irrespective of AI or normal chat.
+Local, searchable storage for conversations from people and coding agents.
 
 <p>
-  <a href="https://github.com/aghontpi/cryo-vault/releases"><img src="https://img.shields.io/github/v/release/aghontpi/cryo-vault?include_prereleases&style=flat-square&label=github-release" alt="release"></a>
+  <a href="https://github.com/aghontpi/cryo-vault/releases"><img src="https://img.shields.io/github/v/release/aghontpi/cryo-vault?style=flat-square&label=release" alt="release"></a>
   <a href="https://github.com/aghontpi/cryo-vault/blob/main/LICENSE"><img src="https://img.shields.io/github/license/aghontpi/cryo-vault?style=flat-square" alt="license"></a>
 </p>
 
 </div>
 
+Cryo Vault is a compact Rust CLI and MCP server for archiving text
+conversations. The current release also discovers local coding-agent
+transcripts through a default-on nightly collector, while keeping lifecycle
+hooks non-blocking and all data local.
+
 ## Features
-- **Built from scratch, designed specifically & optimised for conversations**: Minimal dependencies, single-file architecture.
-- **Cross-platform**: Compiles to native binaries (Mac, Linux, Windows and other platforms).
-- **High Compression**: Uses a compact binary format (`bincode`) and `zstd` (preset 19) for maximum storage efficiency.
-- **Fast Search**: Uses Bloom filters for efficient indexing and querying.
-- **Minimal & Efficient**: Ultra-low RAM (**CLI** runs on < 2MB, **MCP Server** takes < 1MB idle); designed for minimal, efficiency, speed, and performance.
-- **Portable**: Self-contained; just drop the binary in a folder and go.
-- **Dual-Mode**: Works as a standalone **CLI tool**, an **MCP Server** for AI and an **Skill** folder for AI skills.
 
-## Current Limitations
-- **Text Only**: Currently optimized for text-based conversations (images/files are not stored).
-- **Single Writer**: While concurrent implementation exists, heavy concurrent writes are serialised via locking.
+- Automatic local capture with provenance for Codex, Claude Code, GitHub
+  Copilot CLI, Cursor, Gemini CLI, and Google Antigravity.
+- Explicit JSON, JSONL, and ChatGPT-export imports through `cryo add`.
+- Compressed segment storage with Bloom-filter and time-range indexes.
+- Resumable capture sessions, content deduplication, and latest-revision reads.
+- Native CLI and MCP interfaces with no cloud service or account required.
+- Cross-platform binaries for macOS, Linux, and Windows.
 
----
+Current limitations: the archive is text-oriented, and writes are serialized by
+the database lock.
 
-## Getting Started
+### Efficiency and portability
 
-### 1. Install (recommended)
+Cryo Vault is designed for compact, local conversation storage:
 
-A one-shot installer is provided for each major platform. It detects your OS / arch, drops the binaries under `~/.cryo-vault/versions/<version>/`, symlinks (or shims, on Windows) `cryo` and `cryo-vault-mcp` into `~/.cryo-vault/bin`, and wires that directory onto your `PATH` so typing `cryo` from any new terminal Just Works.
+- Sessions use a bincode representation with Zstd level-19 compression.
+- `flush` and `optimise` use block-oriented storage to reduce per-session
+  framing and index overhead.
+- Indexes retain time ranges and Bloom filters, allowing `search` to skip
+  blocks before exact session matching.
+- Readers transparently support `StoredSession::{V1, Block, V2}` across old
+  and current archive segments, without an operator migration step.
+- The CLI and MCP server are native binaries for macOS, Linux, and Windows.
 
-**macOS / Linux:**
+Search and ID lookup scan index entries before reading selected data blocks;
+they are efficient indexed reads, not constant-time lookups. Exact runtime and
+memory usage depend on the archive, query, and host.
+
+## Getting started
+
+### Install a release
+
+Use the [published GitHub release](https://github.com/aghontpi/cryo-vault/releases)
+or build from source. The installer places versioned binaries under
+`~/.cryo-vault`, exposes `cryo` and `cryo-vault-mcp` on `PATH`, and enables the
+local 23:00 capture schedule unless opted out.
+
+macOS / Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.sh | bash
 ```
 
-**Windows (PowerShell):**
+Windows PowerShell:
+
 ```powershell
 iwr -useb https://raw.githubusercontent.com/aghontpi/cryo-vault/main/install.ps1 | iex
 ```
 
-Or, after cloning the repo:
-```bash
-./install.sh           # macOS / Linux
-./install.ps1          # Windows
-```
-
-The installer is idempotent: re-running it upgrades to the latest version and removes any prior install it finds. Useful flags:
-
-| Flag (bash / pwsh) | Purpose |
-| :--- | :--- |
-| `--version v0.3.0` / `-Version v0.3.0` | Pin a specific release. |
-| `--prefix <path>` / `-Prefix <path>` | Change the install location (default `~/.cryo-vault`). |
-| `--source local\|github` / `-Source local\|github` | Force the binary source. Auto-detects `dist/` when run from a clone. |
-| `--force` / `-Force` | Reinstall even if the same version is already present. |
-| `--uninstall` / `-Uninstall` | Remove the install and clean the PATH entry. |
-| `--no-path` / `-NoPath` | Skip editing your shell rc / user PATH. |
-
-After install, `cryo --help` works from any new shell. The MCP server is available as `cryo-vault-mcp` on the same `PATH` — see [C. MCP Server Usage](#c-mcp-server-usage-for-ai) below.
-
-### 2. Building from source
-If you'd rather build it yourself, Cryo Vault produces two binaries:
+The installer also works from a clone:
 
 ```bash
-cargo build --release
+./install.sh
+./install.ps1
 ```
 
-- **CLI Binary**: `target/release/cryo-vault` (Main tool for interacting with the database)
-- **MCP Binary**: `target/release/cryo-vault-mcp` (Server for AI)
-
-> [!TIP]
-> For convenience, alias the CLI binary:
-> `alias cryo="./target/release/cryo-vault"`
-
-### 3. Releases
-
-Release binaries are built by GitHub Actions from the reviewed `main` commit,
-not from a developer workstation. Pull requests produce retained build artifacts
-for all supported desktop targets. Stable releases use a two-step manual flow:
-
-1. Run **Prepare release** from `main` with a `vX.Y.Z` tag and the `draft`
-   stage. It validates the tag against `Cargo.toml`, builds all release binaries,
-   attaches them with `SHA256SUMS-vX.Y.Z.txt`, and creates or refreshes a draft.
-2. Review the draft notes and assets, then run the same workflow with the
-   `publish` stage. Publishing requires the repository's protected `release`
-   environment approval.
-
-Verify downloaded binaries from a release with:
+Release binaries are built from reviewed `main` commits and published with a
+`SHA256SUMS-vX.Y.Z.txt` asset. After downloading a release, verify it with:
 
 ```bash
 shasum -a 256 -c SHA256SUMS-vX.Y.Z.txt
 ```
 
----
+Useful installer options:
 
-## Usage Guide
+| Unix | PowerShell | Purpose |
+| --- | --- | --- |
+| `--version <vX.Y.Z>` | `-Version <vX.Y.Z>` | Pin a release. |
+| `--prefix <path>` | `-Prefix <path>` | Change the install prefix. |
+| `--source local\|github` | `-Source local\|github` | Select binary source. |
+| `--force` | `-Force` | Reinstall the selected version. |
+| `--uninstall` | `-Uninstall` | Remove the install and PATH entry. |
+| `--no-path` | `-NoPath` | Skip PATH changes. |
+| `--no-capture` | `-NoCapture` | Opt out of the default nightly collector. |
 
-Cryo Vault has 3 distinct modes of operation:
+Confirm the installation with `cryo --help`.
 
-### A. CLI Usage
-Use the `cryo-vault` binary to manage your database manually.
+### Build from source
 
-**Common Commands:**
 ```bash
-# Ingest logs from a file
-./target/release/cryo-vault add my_logs.json
-
-# Manual Ingestion (via Stdin)
-# You can pipe a JSON string directly to the 'add' command.
-# This is useful for scripts or quick manual logging.
+cargo build --release
 ```
 
-#### Core Commands Overview (v0.3.0)
-Cryo Vault v0.3.0 adds default-on nightly local capture while retaining the v0.2.0 storage and query compatibility upgrades.
-
-| Command | Usage | Description | Notes |
-| :--- | :--- | :--- | :--- |
-| **`add`** | `cryo add [file]` | Ingests a new single session or bulk array. | Can run via stdin (`-`) or with `--stream` flag for event-driven logs. |
-| **`flush`** | `cryo flush` | Manually flushes completed sessions from the WAL buffer to the active data segment. | **Upgraded**: Now packs pending sessions into optimized, highly compressed blocks (`StoredSession::Block`) rather than loose individual sessions to reduce fragmentation. |
-| **`search`** | `cryo search <query>` | Searches conversation history using indexes and Bloom filters. Supports `--after` and `--before` date/timestamp constraints. | **Upgraded**: Automatically and transparently detects and searches across all block storage versions (V1 single-session, new WAL Block, and legacy V2 compacted blocks) with zero user intervention. |
-| **`show`** | `cryo show <session_id>` | Displays full conversation details and metadata for a specific session ID. | **Upgraded**: Auto-detects and extracts the session from any block format on disk (V1, Block, or legacy V2) with zero overhead. |
-| **`stats`** | `cryo stats` | Computes comprehensive database diagnostics and statistics across all segments. | **Upgraded**: Aggregates diagnostics seamlessly across all block versions (V1, Block, legacy V2), showing accurate session counts, message counts, time ranges, and size. |
-| **`optimise`** | `cryo optimise` | Compacts all segments into dense blocks (default target: ~256KB) for fast search and lower memory. | Uses Zstd level 19 consistently for sizing and output, and writes to `StoredSession::Block`. |
-| **`capture`** | `cryo capture run` | Discovers and archives local transcripts from supported coding agents. | Stable-file gating, resumable session IDs, source fingerprints, and latest-revision semantics. |
-
-#### Nightly cross-platform capture
-
-The v0.3.0 installer enables a local 23:00 capture job by default. It scans
-local transcript files for Codex, Claude Code, GitHub Copilot CLI, Cursor,
-Gemini CLI, and Google Antigravity. Visible user, model, system, and relevant
-tool context is retained; hidden reasoning, internal progress, and client UI
-noise are omitted. The installer also registers marked, short-lived lifecycle
-hooks for Claude Code, Cursor, Gemini CLI, Antigravity, and Copilot CLI. Those
-hooks only enqueue a transcript path/session identifier; the nightly process
-does the parsing and archive write. Codex is scanner-only. Existing `cryo add`
-JSON and ChatGPT-export imports remain available as the generic fallback.
+The binaries are `target/release/cryo-vault` and
+`target/release/cryo-vault-mcp`. When using a build directly, either invoke the
+explicit path or create an alias:
 
 ```bash
-cryo capture run                         # capture all supported clients
-cryo capture run --platform claude-code  # capture one client
-cryo capture run --platform generic      # scan only CRYO_CAPTURE_IMPORT_ROOTS
-cryo capture run --dry-run               # inspect without writing
-cryo capture run --verbose               # print each candidate path and outcome
-cryo capture run --json                  # emit counters and safe candidate diagnostics
-cryo capture run --settle 2s              # re-observe unchanged files in this run
+alias cryo="./target/release/cryo-vault"
+```
+
+### First successful capture
+
+After installing, finish a supported coding-agent session, then run:
+
+```bash
+cryo capture run --verbose
 cryo capture status
-cryo capture install --time 23:00
-cryo capture uninstall                   # removes the schedule, not the archive
+cryo last --source claude-code
 ```
 
-For a manual import of a static transcript, point the generic scanner at a
-temporary or chosen import directory and use a settled run. The settled run
-keeps the database lock while it waits and performs the second unchanged
-observation, so it can import a file in one command:
+The first observation of a changing transcript is deferred. Run the collector
+again after the transcript is unchanged, or use `--settle 1s` for a deliberate
+two-observation manual run. The scheduled collector never waits.
+
+## Usage
+
+### Automatic capture runbook
+
+The installer enables a native 23:00 local scheduler. Claude Code, Cursor,
+Gemini CLI, GitHub Copilot CLI, and Antigravity can additionally enqueue a
+small lifecycle hint; the hook does not parse or write transcript content.
+Codex is scanner-only. Generic imports are disabled unless
+`CRYO_CAPTURE_IMPORT_ROOTS` is explicitly set.
+
+```bash
+cryo capture run                         # scan all supported clients
+cryo capture run --platform claude-code  # narrow the scan
+cryo capture run --platform generic      # scan configured import roots
+cryo capture run --dry-run               # parse and report without writes
+cryo capture run --verbose               # show candidate paths and outcomes
+cryo capture run --json                  # machine-readable safe diagnostics
+cryo capture run --settle 2s              # wait for a second observation
+cryo capture status                       # schedule, hooks, state, hints
+cryo capture install --time 23:00         # enable scheduler and hooks
+cryo capture uninstall                    # remove schedule/hooks, retain data
+```
+
+For a static transcript that is not in a native client root:
 
 ```bash
 export CRYO_CAPTURE_IMPORT_ROOTS="$PWD/my-transcripts"
@@ -162,304 +154,143 @@ cryo capture run --platform generic --settle 1s --verbose
 cryo search "a phrase from the transcript"
 ```
 
-The `--platform` flag can narrow a scan to `codex`, `claude-code`, `copilot-cli`,
-`cursor`, `gemini-cli`, `antigravity`, or `generic`. A normal run never waits:
-the first observation is recorded and the next unchanged run imports the file.
-If that happens, the command prints the exact rerun command; use `--verbose` to
-see the paths and safe reasons. `--json` includes the same aggregate counters,
-per-platform discovery counts, and candidate outcomes, but never transcript
-message text.
-
-Capture is duplicate-safe by default: an unchanged source session (or a
-transcript with the same visible-content fingerprint when no source ID exists)
-is reported as `unchanged` with reason `duplicate already archived`, even after
-the state file is removed or a transcript is moved. Candidate reasons include
-`empty transcript`, `unsupported source record`, `no visible conversation
-records`, and `malformed transcript`.
-`first` and `last` use visible session timestamps and accept `--source
-<platform>` filters. Use `cryo show --diagnostics` for provenance and
-extraction metrics, or `cryo audit provenance` to find legacy sessions whose
+The supported platform values are `codex`, `claude-code`, `copilot-cli`,
+`cursor`, `gemini-cli`, `antigravity`, and `generic`. Diagnostics include
+aggregate counters, platform counts, paths, and safe outcome reasons, never
+transcript message text. `cryo show --diagnostics` displays provenance and
+extraction metrics; `cryo audit provenance` identifies legacy sessions whose
 original source cannot be reconstructed.
 
-The repository includes a self-contained smoke test that uses only a temporary
-database and generic transcript root. It expects a built CLI binary (or the
-`CRYO_BIN` override):
+Capture is duplicate-safe. A source session ID gives a stable capture ID; when
+there is no source ID, a normalized visible-content fingerprint prevents a
+moved or re-seen transcript from being imported twice. A resumed transcript
+gets a new physical revision under the same logical ID, and readers expose only
+the newest revision.
+
+To stop collection, use `cryo capture uninstall`; this does not delete the
+archive. To remove archived data, verify the exact path supplied through
+`--db` or `CRYO_DB_PATH` before deleting it.
+
+### Manual archival and retrieval
+
+Use the direct CLI or MCP path when you have an explicit file, a client with no
+discoverable local transcript, or an immediate import is required. If native
+capture is configured and can discover the same transcript, do not also archive
+that conversation manually: choose one path to avoid duplicate records.
+
+#### CLI commands
+
+| Command | Purpose | Useful options |
+| --- | --- | --- |
+| `cryo add [file]` | Import one JSON session, an array, or a ChatGPT export. | Use `-` for stdin and `--stream` for JSONL stream events. |
+| `cryo capture run` | Discover and archive supported local transcripts. | `--platform`, `--dry-run`, `--verbose`, `--json`, `--settle`. |
+| `cryo capture install` / `uninstall` | Install or remove the local scheduler and marked hooks. | `--time HH:MM`, `--dry-run`. |
+| `cryo capture status` | Inspect scheduler, hooks, capture state, and queued hints. | `--json`. |
+| `cryo flush` | Finalize completed streaming WAL sessions into the archive. | — |
+| `cryo search <query>` | Search visible conversation content. | `--after`, `--before`, `--json`. |
+| `cryo first` / `cryo last` | Browse the oldest or newest visible sessions. | `--source <platform>`. |
+| `cryo show <id>` | Read a full session. | `--diagnostics` shows provenance without message bodies. |
+| `cryo audit provenance` | Find records whose original source cannot be reconstructed. | — |
+| `cryo stats` | Report logical counts and physical storage sizes. | — |
+| `cryo optimise` | Compact the archive into dense compressed blocks. | `--chunk-kb`, `--yes`. |
+| `cryo reindex` | Rebuild indexes from data segments. | `--yes`. |
+
+Run `cryo <command> --help` for the complete option reference.
 
 ```bash
-cargo build
-./scripts/capture-smoke-test.sh
+cryo add conversation.json       # object, array, or ChatGPT export
+cat conversation.json | cryo add -
+cryo add --stream events.jsonl   # streaming session events
+cryo flush                       # archive finalized WAL sessions
+cryo search "database"           # regex-capable content search
+cryo search "error" --after 2025-01-01 --json
+cryo show <session-id>
+cryo show <session-id> --diagnostics
+cryo first 10
+cryo last 10 --source cursor
+cryo stats
+cryo optimise --yes
+cryo reindex --yes
 ```
 
-The nightly scheduler remains a single, non-waiting observation pass. Use
-`--settle` explicitly for manual runs or tests when waiting for a second
-observation is appropriate.
+`search` uses index time ranges and Bloom filters to prune blocks before exact
+matching. `show` reads the matching data block after resolving the session's
+newest revision. `flush` writes finalized streaming sessions as compatible V1
+or Block records; `optimise` compacts archive records into dense blocks.
+`reindex` rebuilds indexes from data files when needed. See [the architecture
+reference](docs/architecture.md) for storage and lookup behavior.
 
-Capture state is stored under the database directory in `capture-state.json`;
-end-of-session hints are first written as independent JSON records in the
-`capture-hints/` queue. The collector merges and deduplicates that queue while
-holding the database lock, then removes only records represented by the saved
-state (and migrates the old `capture-hooks.jsonl` journal once). A source path,
-platform session identifier, visible content fingerprint, and last-seen
-timestamp are recorded as metadata. When a transcript is resumed, the same
-stable ID receives a new revision and all search, show, stats, and reindex
-operations expose the latest revision only.
-Files that are still changing are deferred until a later run: a file must be
-observed identically twice, unless a valid lifecycle hint supplies its concrete
-path. Generic scheduled capture is disabled unless
-`CRYO_CAPTURE_IMPORT_ROOTS` explicitly names one or more import roots. The
-The native hook locations and formats are client-specific: Claude Code keeps a
-nested `SessionEnd` hook in `~/.claude/settings.json`; Cursor uses a direct
-`hooks.sessionEnd` command in `~/.cursor/hooks.json`; Gemini CLI keeps a nested
-`SessionEnd` hook with a 2000 ms timeout in `~/.gemini/settings.json`; Copilot
-CLI uses an `agentStop` hook in `~/.copilot/hooks/cryo-vault.json` with its Unix
-`bash` or Windows `powershell` field and a 2-second timeout; and Antigravity
-uses a named `Stop` hook in `~/.gemini/config/hooks.json`. Antigravity transcript discovery reads
-`~/.gemini/antigravity-cli/brain/**/.system_generated/logs/transcript.jsonl`,
-with the old `antigravity-ide` and `antigravity` roots retained as read-only
-fallbacks. Antigravity's system-generated event records are parsed into visible
-user, model, and tool turns; damaged JSONL lines are skipped when valid turns
-surround them. A system-only file is reported as `no visible conversation
-records`; `malformed transcript` means that no usable records could be
-recovered. History, cache, settings, database files, and `transcript_full.jsonl`
-are excluded. The installer preserves unrelated hook configuration and removes
-only Cryo Vault entries.
+#### JSON input
 
-Privacy is local-only: Cryo Vault reads supported files from the local user
-profile and writes only to the configured local database. It does not upload
-transcripts. To stop collection, run `cryo capture uninstall`; this retains the
-archive. To remove it, use the exact path you configured with `--db` or
-`CRYO_DB_PATH` and verify that path before deleting it; do not infer a path from
-an unset environment variable. The platform installers accept
-`--no-capture` / `-NoCapture` as an explicit opt-out.
+`cryo add` and MCP `add_log` accept a `ChatSessionInput` object, an array of
+objects, or a supported ChatGPT export. The fields are:
 
-## JSON Structure & Parameters Information
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `messages` | array | Yes | Defaults to an empty array for compatibility. |
+| `id` | string | No | A UUID is generated when omitted. |
+| `title` | string | Strongly recommended | Use a specific three-to-seven-word summary. |
+| `source` | string | No | For example, `manual-cli` or `claude-code`. |
+| `model` | string | No | Originating model identifier. |
+| `created_at` | integer | No | Unix timestamp in seconds. |
+| additional fields | JSON values | No | Preserved as session metadata. |
 
-### Session Object (Root)
-| Field | Type | Required? | Description |
-| :--- | :--- | :--- | :--- |
-| **`messages`** | `Array` | **Yes*** | List of message objects. (*Defaults to empty if missing) |
-| `id` | `String` | No | Unique ID (UUID). Auto-generated if omitted. |
-| `title` | `String` | No (strongly recommended) | A 3–7 word summary of the session. See [Title expectations](#title-expectations) — omitting this leaves the entry showing up as `Untitled` in `cryo last` / `cryo search`. |
-| `source` | `String` | No | Origin (e.g., "cli", "vscode"). |
-| `model` | `String` | No | AI model name (e.g., "gpt-4"). |
-| `created_at` | `Number` | No | Unix timestamp (seconds). |
-| *`...`* | *Any* | No | Extra fields are stored as **metadata**. |
+Each message requires `role` and `content`. Supported roles are `user`,
+`model` (or `assistant`), `system`, `thought`, and `tool`. A message can also
+include `id`, `parent_id`, `tool_calls`, `tool_outputs`, and additional
+metadata.
 
-### Message Object (Inside `messages`)
-| Field | Type | Required? | Description |
-| :--- | :--- | :--- | :--- |
-| **`role`** | `String` | **Yes** | "user", "model", "system", "thought", "tool". |
-| **`content`** | `String` | **Yes** | The text content. |
-| `id` | `String` | No | Unique ID for the message. |
-| `parent_id` | `String` | No | ID of the parent message. |
+A minimal session is:
 
-### Title expectations
-
-The `title` field is technically optional for backwards compatibility, but **callers should treat it as required**. It's what `cryo last`, `cryo first`, and `cryo search` print as the human-readable label for each session — when it's missing, the archive becomes a wall of `Untitled` entries that's almost impossible to browse.
-
-When ingesting via the MCP server (i.e. from an AI client), the model is expected to summarise the session into the title field at ingest time. Good titles are:
-
-- **3–7 words**, lowercase or sentence-case, no trailing punctuation.
-- A **summary of what the session is about**, not a re-statement of the first user message verbatim.
-- Specific enough to find with `cryo search` later.
-
-Examples of good titles: `JWT auth refresh flow`, `Debug Nginx streaming proxy`, `Migrate Postgres to RDS`, `Reproducible build metadata removal`.
-
-Do **not** send the literal strings `Untitled`, `Chat`, `Conversation`, `New chat`, or an empty string — write an actual summary instead. If you genuinely can't summarise the content (e.g. the session contains a single one-word message), fall back to a short topical phrase (`Quick lookup`, `One-off question`) rather than a placeholder.
-
-```bash
-## Full Example
-
-echo '{
-  "title": "Full Feature Demo",
+```json
+{
+  "title": "JWT auth refresh flow",
   "source": "manual-cli",
-  "model": "gpt-4o",
-  "created_at": 1706123456,
-  "custom_tag": "release-candidate",  
   "messages": [
-    {
-      "role": "system",
-      "content": "You are a coding assistant."
-    },
-    {
-      "role": "user",
-      "content": "Explain Rust enums.",
-      "id": "msg-1"
-    },
-    {
-      "role": "model",
-      "content": "Enums in Rust are types that...",
-      "parent_id": "msg-1",
-      "rating": 5
-    }
+    { "role": "user", "content": "How should token refresh work?" },
+    { "role": "model", "content": "Use a short-lived access token..." }
   ]
-}' | ./target/release/cryo-vault add 
+}
 ```
+
+`messages` defaults to an empty array for compatibility. A session can also
+include `id`, `model`, `created_at`, and additional metadata. Roles are
+`user`, `model`, `system`, `thought`, and `tool`. Always provide a specific
+3–7-word `title`; do not use `Untitled`, `Chat`, `Conversation`, `New chat`, or
+an empty string.
+
+#### End-to-end CLI example
 
 ```bash
-## Full Flow Example (CLI)
+cat > conversation.json <<'JSON'
+{
+  "title": "Terminal archive example",
+  "source": "manual-cli",
+  "model": "example-model",
+  "messages": [
+    { "role": "user", "content": "Archive this conversation." },
+    { "role": "model", "content": "The session is now stored locally." }
+  ]
+}
+JSON
 
-# 1. Ingest a log (using stdin)
-$ echo '{"title": "Terminal Demo", "messages": [{"role": "user", "content": "I am adding this log using a string piped to stdin"}]}' | ./target/release/cryo-vault add 
-
-# 2. Search for the log
-$ ./target/release/cryo-vault search "piped to stdin"
-
-# [7c4c8f31-66a4-4de9-8df8-63b05878a564] Terminal Demo
-
-# 3. Display the full conversation
-$ ./target/release/cryo-vault show 7c4c8f31-66a4-4de9-8df8-63b05878a564
-
-# Session: 7c4c8f31-66a4-4de9-8df8-63b05878a564
-# Title: Terminal Demo
-# 
-# Messages (1):
-# 
-# --- Message 1 (User) ---
-# I am adding this log using a string piped to stdin
-
+cryo add conversation.json
+cryo search "stored locally"
+# Copy the returned ID, then inspect the complete record:
+cryo show <session-id>
 ```
 
-## Search (another example)
+### MCP server
 
-```bash
-$ ./target/release/cryo-vault search "aws"
+`cryo-vault-mcp` exposes the same local archive to MCP-compatible clients. The
+installer writes ready-to-paste snippets under `~/.cryo-vault/`:
 
-# ...
-# [671ab448-e878-800b-a848-c43ef61504d8] Nginx Configuration for Streaming
-# [670e8b9b-0ad8-800b-a97c-662cbb7bd2ec] Zuul Filter zu Spring Boot
-# [66deb26e-2fa0-800b-88bf-5e16cdf44c13] Configuring Apigee DNS AWS
-# ...
+| File | Top-level key | Use |
+| --- | --- | --- |
+| `mcp-config.snippet.json` | `mcpServers` | Claude Code, Cursor, Antigravity, Claude Desktop |
+| `mcp-config.vscode.snippet.json` | `servers` | VS Code native MCP |
 
-# Show a specific conversation
-$ ./target/release/cryo-vault show 671ab448-e878-800b-a848-c43ef61504d8 
-
-# Session: 671ab448-e878-800b-a848-c43ef61504d8
-# Title: Nginx Configuration for Streaming
-# Source: chatgpt-export
-# Created: 1729803337 (2024-10-24 20:55:37 UTC)
-# 
-# Messages (6):
-# 
-# --- Message 1 (User) ---
-# I hosted a java spring reactive jar inside aws and used reverse proxy, the app has "stream" api...
-# 
-# --- Message 2 (Tool) ---
-# **Identifying the issue**
-# 
-# The streaming API isn't functioning properly via Nginx, despite POST and GET requests working fine. The nginx configuration, specifically for /task-be/, might need adjustments..(removed for brevity)
-
-```
-
-### v0.2.0 Core Command Upgrades & Backwards Compatibility
-
-Cryo Vault v0.2.0 introduces a unified storage architecture that brings deep performance enhancements while maintaining complete backwards compatibility with older formats.
-
-#### 1. Transparent Multi-Format Support (`search`, `show`, `stats`)
-Retrieval, inspection, and database diagnostics now dynamically adapt to your storage history. When you run `search`, `show`, or `stats`, Cryo Vault automatically scans the indexing files and transparently decodes all stored formats on the fly with **zero manual configuration, translation layers, or schema migrations**:
-* **`V1` (Single-Session)**: Standard un-compacted session formats.
-* **`Block` (New WAL Streaming Block)**: Dense multi-session blocks generated during WAL flushes.
-* **Legacy `V2` (Legacy Optimize compacted block)**: Legacy multi-session structures imported from legacy optimization branches.
-
-Whether your data is split across old single sessions, modern streams, or legacy compacted segments, the search engine utilizes bloom filter pruning and time-range boundaries to search all of them simultaneously in sub-milliseconds.
-
-#### 2. Highly Compressed Manual WAL Flush (`flush`)
-In previous versions, writing/streaming logs via the WAL would write individual loose sessions upon being flushed. Under v0.2.0, the `flush` command has been upgraded to maintain a high-density storage layout by default:
-* Calling `cryo flush` aggregates completed sessions from the Write-Ahead Log (`pending.bin`).
-* It packs these sessions together and writes them as an optimized, highly compressed block (`StoredSession::Block`) directly to the active database segment (`.cryo`).
-* This eliminates raw, fragmented single-session structures, drastically reduces disk I/O, minimizes index lookups, and significantly speeds up subsequent query runs.
-
----
-
-### Database Compaction & Optimisation (`optimise`)
-
-Over time, appending loose sessions or streaming logs via the WAL can result in numerous individual session entries on disk. To minimize file handle overhead, optimize indexing, and accelerate search queries, Cryo Vault provides an `optimise` command to compact loose sessions into high-density compressed blocks.
-
-#### How Compaction Works
-- **Consolidated Archival**: It reads all sessions from the active database segment and flushes the Write-Ahead Log (WAL) buffer to ensure all recent activity is included.
-- **Two-Phase High-Speed Compression**:
-  - The packer loop uses a cheap raw-size gate before trial-compressing the growing chunk with the same **Zstd Level 19** settings used for the final block.
-  - Once the target size limit is triggered, the packer seals the block and compresses it at **Zstd Level 19 exactly once** prior to writing it to disk.
-  - This reduces the number of Level 19 compressions from $O(N^2)$ to exactly $O(1)$ per block, resulting in a **10x to 100x execution speedup** while preserving maximum storage efficiency.
-- **Backwards Compatibility**: Compressed blocks are serialized as `StoredSession::Block`, which remains fully queryable and backwards-compatible with standard query pipelines.
-
-#### Usage
-```bash
-# Compact the database to the default target block size of ~256 KB
-./target/release/cryo-vault optimise
-
-# Compact the database targeting a specific compressed chunk size (e.g., 512 KB)
-./target/release/cryo-vault optimise --chunk-kb 512
-
-# Run compaction non-interactively (ideal for automated cron jobs or deployment hooks)
-./target/release/cryo-vault optimise --yes
-```
-
-#### CLI Options
-| Option | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--chunk-kb` | `usize` | `256` | Target compressed block size in Kilobytes (KB) to group sessions into. |
-| `--yes` | `flag` | - | Skip the interactive confirmation prompt. |
-
-### B. Specific Workflows (Skills)
-Check the **[`Skills/`](Skills/)** directory! It contains guides and scripts for specific tasks, such as:
-- [**Store Conversations**](Skills/store-conversations/SKILL.md): detailed guide on importing logs, searching history, and using the CLI effectively.
-- [**Auto-Capture**](Skills/auto-capture/SKILL.md): canonical instruction snippet that tells any AI agent to archive every finished conversation to Cryo Vault — see the next section for how to install it.
-
-### C. Auto-Capture across AI agents
-
-Tell Claude Code, GitHub Copilot, Antigravity (and any other agent that reads the cross-tool `AGENTS.md` convention) to **automatically archive every finished conversation** to Cryo Vault. The agent itself does the write — preferring the `add_log` MCP tool when connected, falling back to `cryo add` otherwise — so no extra background process is needed.
-
-A one-shot installer drops the instruction snippet (between `<!-- cryo-vault:auto-capture start/end -->` markers, so re-runs replace in place) into the right rule-file for each client:
-
-| Client | Rule file the installer writes to |
-| :--- | :--- |
-| Claude Code (global) | `~/.claude/CLAUDE.md` |
-| Antigravity + cross-tool agents (global) | `~/.gemini/AGENTS.md` |
-| VSCode Copilot (project) | `./.github/copilot-instructions.md` |
-
-```bash
-# macOS / Linux
-./install-agent-rules.sh
-
-# Windows (PowerShell)
-./install-agent-rules.ps1
-```
-
-Useful flags (both scripts):
-
-| Flag (bash / pwsh) | Purpose |
-| :--- | :--- |
-| `--uninstall` / `-Uninstall` | Strip the snippet from every target. |
-| `--dry-run` / `-DryRun` | Print what would change without modifying files. |
-| `--skip-claude` / `-SkipClaude` | Leave Claude Code's CLAUDE.md alone. |
-| `--skip-agents` / `-SkipAgents` | Leave Antigravity / AGENTS.md alone. |
-| `--skip-copilot` / `-SkipCopilot` | Leave Copilot's instructions file alone. |
-
-Pair this with the MCP server (next section) for the best experience: agents see `add_log` in their tool list, follow its built-in schema and title rules, and your archive fills itself.
-
-### D. MCP Server Usage (For AI)
-The `cryo-vault-mcp` binary is designed to be run by AI clients like Claude Code, Cursor, VSCode, Antigravity, or Claude Desktop. It speaks the [Model Context Protocol](https://modelcontextprotocol.io/).
-
-**The installer writes ready-to-paste MCP config snippets** under `~/.cryo-vault/` (Windows: `%USERPROFILE%\.cryo-vault\`) with the resolved binary path already baked in, so you don't have to hand-edit absolute paths. Two snippets are produced (re-running the installer overwrites them in place — never duplicates):
-
-| File | Schema | Use for |
-| :--- | :--- | :--- |
-| `~/.cryo-vault/mcp-config.snippet.json` | top-level `mcpServers` | Claude Code, Cursor, Antigravity, Claude Desktop |
-| `~/.cryo-vault/mcp-config.vscode.snippet.json` | top-level `servers` | VSCode native MCP (note: different key) |
-
-Paste the relevant snippet into the right config for each client:
-
-| Client | Where to paste |
-| :--- | :--- |
-| **Claude Code** | `~/.claude.json` under `mcpServers` — or simpler: `claude mcp add cryo-vault ~/.cryo-vault/bin/cryo-vault-mcp --scope user` |
-| **Cursor** | `~/.cursor/mcp.json` |
-| **Antigravity** | IDE → *Manage MCP Servers* → *View raw config* |
-| **VSCode** | Command Palette → *MCP: Open User Configuration* (use the `vscode.snippet.json` — key is `servers`, not `mcpServers`) |
-
-The installer also prints this guide at the end of its run, so you don't need to come back to the README.
-
-If you'd rather wire it by hand, the underlying shape is just:
+The installer prints the client-specific destination. The essential shape is:
 
 ```json
 {
@@ -467,131 +298,66 @@ If you'd rather wire it by hand, the underlying shape is just:
     "cryo-vault": {
       "command": "/absolute/path/to/cryo-vault-mcp",
       "args": [],
-      "env": {
-        "CRYO_DB_PATH": "/Users/username/.cryo"
-      }
+      "env": { "CRYO_DB_PATH": "~/.cryo" }
     }
   }
 }
 ```
----
 
-**Examples for MCP Server:**
+The MCP `add_log` tool is appropriate for an explicit immediate archive. When
+the native collector is enabled for the same client, let the collector own
+that transcript instead.
 
-1. **Direct JSON Object (Single Session):**
-```json
-{
-  "data": {
-    "id": "optional-uuid", 
-    "messages": [
-      { "role": "user", "content": "Hello" },
-      { "role": "model", "content": "Hi there" }
-    ]
-  }
-}
+### Agent rule installation
+
+The agent-rules installer writes a marked pointer/instruction block to the
+following files and is idempotent:
+
+| Client | Target |
+| --- | --- |
+| Claude Code | `~/.claude/CLAUDE.md` |
+| Antigravity and cross-tool agents | `~/.gemini/AGENTS.md` |
+| VS Code Copilot | `./.github/copilot-instructions.md` |
+
+```bash
+./install-agent-rules.sh
+./install-agent-rules.sh --dry-run
+./install-agent-rules.sh --uninstall
 ```
 
-2. **Direct JSON Array (Multiple Sessions):**
-```json
-{
-  "data": [
-    {
-      "messages": [{ "role": "user", "content": "Session 1" }]
-    },
-    {
-      "messages": [{ "role": "user", "content": "Session 2" }]
-    }
-  ]
-}
+PowerShell uses the equivalent `-DryRun`, `-Uninstall`, `-SkipClaude`,
+`-SkipAgents`, and `-SkipCopilot` flags. The full behavior is defined in the
+[auto-capture skill](Skills/auto-capture/SKILL.md), not duplicated in each
+client's rule file.
+
+## Architecture
+
+The archive consists of compressed data segments, parallel indexes, a framed
+streaming WAL, capture state, and durable hint records. Automatic capture
+normalizes eligible local transcripts into sessions with provenance, then
+appends data and index records under the database lock. Logical readers resolve
+the newest revision while historical physical revisions may remain until
+compaction.
+
+![Capture lifecycle](docs/diagrams/capture-lifecycle.png)
+
+![Architecture overview](docs/diagrams/architecture-overview.png)
+
+Read the [canonical architecture document](docs/architecture.md) for component
+ownership, supported inputs, storage compatibility, operational lifecycle, and
+the embedded editable source for every diagram.
+
+## Validation
+
+Run the repeatable documentation and release gate before publishing changes:
+
+```bash
+./scripts/docs-validation.sh
 ```
 
-3. **File Path:**
-```json
-{
-  "data": "/absolute/path/to/chat_log.json",
-  "is_file_path": true
-}
-```
+It checks embedded diagram source extraction and rendering, local Markdown links and
+anchors, stale claims, formatting, tests, the capture smoke test, and CLI help.
 
-4. **Raw JSON String:**
-```json
-{
-  "data": "{\"messages\": [{\"role\": \"user\", \"content\": \"escaped json string\"}]}"
-}
-```
+## License
 
-## Efficiency of this MCP server
-
-Since its running natively, it just takes 800KB of memory when in idle, while other npx MCP servers take up 50MB of memory when idle.
-
-<img src="docs/efficiency-of-mcp-server.png" width="500" />
-
-
-## Example of running with cli stats
-Even your entire life conversations can be stored in less small file sizes
-
-below is my entire chatgpt logs for over 2 years.
-
-```
-# View database statistics
-./target/release/cryo-vault stats
-
-Database Statistics 
-===================
-Active File:      data_001.cryo
-Total Sessions:   1740
-Total Messages:   13050
-Disk Usage:       5.58 MB
-Time Range:       2023-07-08 16:15:28 UTC to 2026-01-25 23:15:08 UTC
-```
-
-> [!NOTE]
-> Under the hood, `stats` computes sizes and ranges transparently across all segment files and all compression formats (V1, Block, and legacy V2) with zero user intervention.
-
-
-
-
-## Architecture 
-
-### Core
-*Standard import for bulk files or single sessions, bypassing the WAL for performance.*
-<img src="docs/diagrams/import_standard.png" width="500" />
-
-*Specialized parsing flow for OpenAI ChatGPT export files.*
-<img src="docs/diagrams/import_chatgpt.png" width="500" />
-
-*Event-driven streaming archival using a Write-Ahead Log (WAL) for safety.*
-<img src="docs/diagrams/import_stream.png" width="500" />
-
-### Search & Retrieval
-*Efficient keyword search using Bloom filters and time-range pruning.*
-<img src="docs/diagrams/search.png" width="500" />
-
-*O(1) lookup of full session details by unique ID.*
-<img src="docs/diagrams/show.png" width="500" />
-
-### Maintenance
-*Rebuilding the indexing metadata from raw session data.*
-<img src="docs/diagrams/reindex.png" width="500" />
-
-*Automatic segment rotation logic to manage large-scale data files.*
-<img src="docs/diagrams/rotation.png" width="500" />
-
-#### Database Compaction (Optimise)
-*Consolidating WAL segments and active sessions into high-density Zstd compressed blocks.*
-<img src="docs/diagrams/optimise.png" width="500" />
-
-#### High-Density Flush
-*Packing unsealed active V1 JSON files into a single V2 Block for density.*
-<img src="docs/diagrams/flush.png" width="500" />
-
-#### Storage Statistics
-*Dynamically calculating storage sizes across mixed schema formats.*
-<img src="docs/diagrams/stats.png" width="500" />
-
-### Contributing
-PRs are welcome! Whether it is a bug fix, new feature, or documentation improvement, feel free to open a pull request.
-Please ensure that your code follows standard Rust conventions and that all tests pass before submitting.
-
-### License
 This project is licensed under the [GPL-3.0 License](LICENSE).

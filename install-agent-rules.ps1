@@ -86,28 +86,22 @@ if (-not (Test-Path $SkillPath)) {
 }
 
 $SnippetBody = @'
-## Cryo Vault — auto-archive conversations
+## Cryo Vault — local capture
 
-At the end of every conversation, archive the session to Cryo Vault so it
-becomes searchable later.
+If native capture is installed and can discover this conversation's transcript,
+let the scheduled collector archive it. Do not also call `add_log` or `cryo add`
+for the same transcript.
 
-1. **Preferred:** call the `add_log` tool on the `cryo-vault` MCP server.
-   The tool description carries the full session schema and the title
-   rules — follow them. Nothing else to read.
+If a lifecycle hook is available, keep it non-blocking by queueing
+`cryo capture hint --platform <platform> --stdin`; the collector performs
+parsing and database writes. Codex is scanner-only.
 
-2. **Fallback (only if the MCP server is not connected):** pipe the
-   session JSON to `cryo add -`. Do **not** guess the schema — read
-   the `store-conversations` skill or `cryo --help` first.
+Use MCP `add_log`, or `cryo add -` when MCP is unavailable, only when the
+transcript is not discoverable or the user explicitly wants an immediate
+archive. Always include a specific 3–7-word title; never use placeholders such
+as "Untitled", "Chat", "Conversation", "New chat", or "".
 
-Always include a `title` of 3–7 words that summarises the session.
-Never send placeholders like "Untitled", "Chat", "New chat", or "".
-
-If the platform exposes a lifecycle hook and nightly capture is enabled, keep
-the hook non-blocking by queueing `cryo capture hint --platform <platform>`;
-the scheduled collector performs transcript parsing and database writes.
-
-See the full guidance in `Skills/auto-capture/SKILL.md` of the
-cryo-vault repo.
+See the full guidance in `Skills/auto-capture/SKILL.md` of the cryo-vault repo.
 '@
 
 $SnippetBlock = "$MarkerBegin`n$SnippetBody`n$MarkerEnd"
