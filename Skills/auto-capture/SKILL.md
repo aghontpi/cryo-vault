@@ -1,124 +1,87 @@
 ---
-name: Cryo Vault Auto-Capture (end-of-conversation archival)
-description: Standing instruction for any AI agent (Claude Code, GitHub Copilot, Antigravity, Cursor, etc.) to automatically archive every finished conversation into the Cryo Vault database. Read this once at the start of a session; act on it when the session ends.
+name: Cryo Vault Auto-Capture
+description: Standing guidance for archiving coding-agent conversations through the native local collector or, when needed, an explicit MCP/CLI import.
 version: 0.3.0
 ---
 
 # Cryo Vault — Auto-Capture
 
-Cryo Vault v0.3.0 also runs a local, default-on collector at 23:00 when the
-platform installer is used. `cryo capture install` installs marked,
-non-blocking lifecycle hooks for Claude Code, Cursor, Gemini CLI, Antigravity,
-and GitHub Copilot CLI; each hook only enqueues a lightweight JSON hint
-(`cryo capture hint --stdin`). Claude and Gemini retain their nested
-`SessionEnd` groups, Cursor uses a direct `hooks.sessionEnd` command, Copilot
-uses an `agentStop` hook in `~/.copilot/hooks/cryo-vault.json`, and Antigravity
-uses a named `Stop` hook in `~/.gemini/config/hooks.json`. Codex remains
-scanner-only. Parsing and
-database writes belong to the scheduled collector. Users can opt out with the
-installer flag `--no-capture` / `-NoCapture` or remove the schedule with
-`cryo capture uninstall`.
+Cryo Vault can collect local coding-agent transcripts at the default 23:00
+schedule. The collector supports Codex, Claude Code, GitHub Copilot CLI,
+Cursor, Gemini CLI, and Google Antigravity. Codex is scanner-only. Claude Code,
+Cursor, Gemini CLI, Copilot CLI, and Antigravity may use marked lifecycle hooks;
+those hooks only enqueue a lightweight hint and never parse or write transcript
+content.
 
-At the **end of every conversation**, archive the session to Cryo Vault so it
-becomes searchable later via `cryo search` or the `cryo-vault` MCP server.
+## Choose one archival path
 
-When the local v0.3.0 scheduler is enabled, lifecycle hooks remain
-non-blocking: they enqueue `cryo capture hint --platform <platform> --stdin`
-and leave transcript parsing and database writes to the 23:00 collector. Manual
-MCP/CLI archival remains useful for clients without a discoverable local
-transcript.
+When native capture is installed and can discover the current client's
+transcript, let it own the archive. Do not also call MCP `add_log` or `cryo add`
+for the same conversation: that creates a duplicate path.
 
-The collector is local-only. It reads supported transcript files from the user
-profile and writes the local Cryo Vault database; it does not upload
-transcripts. Hints are durable independent queue records, not a shared journal,
-and unrelated client configuration is preserved. Uninstall removes only the
-Cryo Vault scheduler and marked hooks; it retains the archive and user hooks.
+Use an explicit archive only when the client has no discoverable local
+transcript, native capture is not configured, or the user explicitly requests
+an immediate import. In that case, use the first available option:
 
-This file is the canonical source of truth. The installer
-(`install-agent-rules.sh` / `.ps1`) drops a short pointer to it into the
-rule-file of each AI client (`~/.claude/CLAUDE.md`, `~/.gemini/AGENTS.md`,
-`.github/copilot-instructions.md`). All clients converge on the rules below.
+1. Call the `add_log` tool on the `cryo-vault` MCP server.
+2. If MCP is unavailable, pipe the session JSON to `cryo add -`.
 
-## How to archive
+The MCP tool description and `cryo --help` are authoritative for the input
+schema. The [store-conversations skill](../store-conversations/SKILL.md) and
+[capture runbook](../../README.md#automatic-capture-runbook) describe the
+operational alternatives.
 
-Use the **first option that is available** to you:
+## Lifecycle hooks
 
-### 1. Preferred — `cryo-vault` MCP server
+If a platform hook is installed, keep it non-blocking. It should enqueue a
+hint, for example:
 
-If the `cryo-vault` MCP server is connected, call its **`add_log`** tool.
+```bash
+cryo capture hint --platform <platform> --stdin
+```
 
-The tool's own description carries the full session schema and the title
-rules — follow them. You do not need to consult any other doc; everything
-you need to construct a valid payload is in the tool's input schema.
+The hint may contain a source session ID and/or concrete transcript path. The
+scheduled collector performs discovery, stability checks, parsing,
+deduplication, and database writes under the database lock. Hints are durable
+independent JSON records under `capture-hints/`.
 
-Minimal example payload:
+## Manual archive payload
+
+For an explicit MCP or CLI archive, always include a useful title:
 
 ```json
 {
-  "data": {
-    "title": "JWT auth refresh flow",
-    "messages": [
-      { "role": "user",  "content": "..." },
-      { "role": "model", "content": "..." }
-    ]
-  }
+  "title": "JWT auth refresh flow",
+  "source": "cursor",
+  "messages": [
+    { "role": "user", "content": "..." },
+    { "role": "model", "content": "..." }
+  ]
 }
 ```
 
-### 2. Fallback — `cryo add` CLI
+Titles should be 3–7 words, sentence-case or lowercase, without trailing
+punctuation. Never use `Untitled`, `Chat`, `Conversation`, `New chat`, or an
+empty string. Include one message per visible turn in order. Roles may be
+`user`, `model`, `system`, `thought`, or `tool`; omit hidden reasoning and
+internal orchestration noise that has no value to a future reader.
 
-Only if the MCP server is **not** connected, fall back to the CLI:
+When known, include `source` and `model`. These fields and capture provenance
+make later searches and audits useful.
 
-```bash
-echo '<session-json>' | cryo add -
-```
+## Local-only and lifecycle guarantees
 
-Do **not** guess the schema. Before constructing the JSON, read one of:
+The collector reads supported files from the local user profile and writes the
+configured local database. It does not upload transcripts. Diagnostics expose
+paths, classifications, counters, and extraction metadata, never transcript
+message text.
 
-- The `store-conversations` skill: `~/.cryo-vault/Skills/store-conversations/SKILL.md`
-  (or, in this repo, `Skills/store-conversations/SKILL.md`)
-- `cryo --help` and `cryo add --help`
-- The "JSON Structure & Parameters" section of the Cryo Vault README
+The collector requires two identical file observations unless a valid hint
+provides a concrete path. A resumed transcript keeps its stable logical ID and
+is stored as a new revision; reads expose the newest revision only. Content
+fingerprints prevent duplicate imports when a source ID is unavailable or a
+transcript is moved.
 
-The CLI accepts the same `ChatSessionInput` shape the MCP tool documents.
-
-## Title rules (apply to both paths)
-
-- **Required in spirit, optional in the wire format.** Always send a `title`.
-- **3–7 words**, sentence-case or lowercase, no trailing punctuation.
-- A **summary** of what the session was about — not a verbatim copy of the
-  first user message.
-- **Never** send placeholders: `"Untitled"`, `"Chat"`, `"Conversation"`,
-  `"New chat"`, or `""`. If the session genuinely resists summary (a one-line
-  lookup, a single test message), use a short topical phrase like
-  `"Quick lookup"` or `"One-off question"` instead.
-
-Good titles: `JWT auth refresh flow`, `Debug Nginx streaming proxy`,
-`Migrate Postgres to RDS`, `Reproducible build metadata removal`.
-
-## What to include in `messages`
-
-- One entry per turn in the conversation, in order.
-- `role` is `"user"`, `"model"`, `"system"`, `"thought"`, or `"tool"`.
-- `content` is the text of that turn.
-- Skip purely internal tool-orchestration noise that has no informational
-  value to a future reader; keep tool calls/results that are part of the
-  reasoning trail.
-
-## When to archive
-
-- At the end of the conversation, before the user closes the session.
-- If the conversation is long-running and naturally pauses (e.g. user says
-  "thanks, that's it"), archive at that pause rather than waiting forever.
-- Do **not** archive on every turn — one archive per coherent session.
-
-## Source fields (optional but useful)
-
-When you know them, include:
-
-- `source`: which client you're running in — e.g. `"claude-code"`,
-  `"copilot-vscode"`, `"antigravity"`, `"cursor"`.
-- `model`: the model ID generating the responses — e.g. `"claude-opus-4-7"`,
-  `"gemini-2.5-pro"`, `"gpt-5"`.
-
-These make `cryo search` results easier to filter later.
+Users can opt out during installation with `--no-capture` / `-NoCapture`, or
+remove the schedule and marked hooks with `cryo capture uninstall`. Uninstall
+retains the archive and unrelated client configuration.
