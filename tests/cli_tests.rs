@@ -13,6 +13,45 @@ fn cryo_command(db_path: &Path) -> Command {
 }
 
 #[test]
+fn test_capture_dry_run_reports_no_saved_observation_or_import() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("db");
+    let root = temp_dir.path().join("imports");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("session.json"),
+        r#"{"session_id":"dry","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        cryo_command(&db_path)
+            .env("CRYO_CAPTURE_IMPORT_ROOTS", &root)
+            .args([
+                "capture",
+                "run",
+                "--platform",
+                "generic",
+                "--dry-run",
+                "--verbose",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "dry runs do not save observations",
+            ))
+            .stdout(predicate::str::contains("Capture would write 0"))
+            .stderr(predicate::str::contains("dry run does not save it"));
+    }
+    cryo_command(&db_path)
+        .env("CRYO_CAPTURE_IMPORT_ROOTS", &root)
+        .args(["capture", "run", "--platform", "generic"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unstable 1"));
+}
+
+#[test]
 fn test_cli_capture_run_and_idempotency() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join(".cryo");
