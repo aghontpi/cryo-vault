@@ -1,0 +1,384 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1a3232;
+  background: #f8faf9;
+  font-size: 15px;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header {
+  height: 68px;
+  background: white;
+  border-bottom: 1px solid #e5eeeb;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 32px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 17px;
+}
+.logo {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  background: #174d49;
+  color: white;
+  border-radius: 9px;
+  font-weight: 700;
+}
+.logo.large {
+  width: 44px;
+  height: 44px;
+  font-size: 22px;
+}
+.muted {
+  color: #657d78;
+  font-size: 13px;
+}
+main {
+  display: grid;
+  grid-template-columns: 364px minmax(0, 1fr);
+  height: calc(100vh - 68px);
+}
+aside {
+  overflow: auto;
+  background: #fff;
+  border-right: 1px solid #e5eeeb;
+  padding: 26px 24px;
+}
+h1 {
+  font-size: 20px;
+  margin: 0;
+}
+h2 {
+  font-size: 27px;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+.list-heading,
+.reader-top,
+.list-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.list-heading {
+  margin-bottom: 20px;
+}
+button,
+input,
+select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+  border: 0;
+  border-radius: 8px;
+  background: #eef4f1;
+  color: #32564f;
+  padding: 9px 12px;
+}
+button:hover:not(:disabled) {
+  background: #dcece5;
+}
+button:disabled,
+select:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid #287963;
+  outline-offset: 2px;
+}
+.text-button {
+  background: transparent;
+  color: #5c7770;
+  font-size: 13px;
+  padding: 5px;
+}
+input[type="search"],
+input[type="date"],
+select {
+  border: 1px solid #dbe6e2;
+  border-radius: 9px;
+  background: #fff;
+  color: #273e3b;
+  padding: 10px;
+  width: 100%;
+  min-width: 0;
+}
+.filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}
+.filters label {
+  font-size: 12px;
+  color: #70857f;
+}
+.filters label:first-child {
+  grid-column: span 2;
+}
+.filters input,
+.filters select {
+  margin-top: 4px;
+  font-size: 13px;
+  padding: 8px;
+}
+.list-label {
+  margin: 22px 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #829590;
+  letter-spacing: 0.06em;
+}
+.session {
+  display: block;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  padding: 13px 14px;
+  margin-bottom: 4px;
+}
+.session.selected {
+  background: #e8f3ef;
+}
+.session strong,
+.session span {
+  display: block;
+}
+.session strong {
+  font-size: 14px;
+}
+.session .meta {
+  font-size: 11px;
+  color: #728781;
+  margin-top: 7px;
+  text-transform: uppercase;
+}
+.session .preview {
+  font-size: 12px;
+  color: #7d918b;
+  margin-top: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.reader {
+  overflow: auto;
+  padding: 38px 56px;
+}
+.reader article {
+  max-width: 790px;
+  margin: auto;
+}
+.reader-top {
+  gap: 16px;
+  margin-bottom: 28px;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+}
+.actions button,
+.find-panel button {
+  font-size: 12px;
+}
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  color: #7c928c;
+}
+.reader #subtitle {
+  margin: 12px 0 28px;
+}
+.reader #messages {
+  border-top: 1px solid #e3ece8;
+  padding-top: 26px;
+}
+.message {
+  margin-bottom: 26px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.author {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 600;
+  color: #526b65;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.avatar {
+  width: 25px;
+  height: 25px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #dcece6;
+  color: #36665a;
+  font-size: 11px;
+}
+.avatar.model {
+  background: #276b61;
+  color: white;
+}
+.content {
+  white-space: pre-wrap;
+  line-height: 1.65;
+}
+.code {
+  background: #172a2c;
+  color: #d9eee6;
+  border-radius: 10px;
+  margin: 12px 0;
+  overflow: auto;
+}
+.code-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  color: #a5c2b9;
+  font-size: 11px;
+}
+.code-head button {
+  background: transparent;
+  color: #c4d9d0;
+  font-size: 12px;
+  padding: 4px;
+}
+.code pre {
+  font:
+    13px/1.6 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  padding: 0 16px 15px;
+  margin: 0;
+  white-space: pre;
+  overflow: auto;
+}
+.kw {
+  color: #8bdac1;
+}
+.str {
+  color: #f3cc89;
+}
+.comment {
+  color: #9ab1aa;
+}
+.details {
+  background: white;
+  border: 1px solid #dce8e3;
+  padding: 16px;
+  border-radius: 10px;
+  margin-bottom: 20px;
+  overflow-wrap: anywhere;
+}
+.details dl {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px;
+  margin: 0;
+}
+.details dt {
+  color: #718780;
+}
+.details dd {
+  margin: 0;
+}
+.find-panel {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.find-panel .muted {
+  white-space: nowrap;
+}
+.find-panel[hidden],
+article[hidden],
+.empty[hidden],
+.details[hidden],
+#more[hidden] {
+  display: none;
+}
+mark {
+  background: #ffe39a;
+  color: #172c28;
+  border-radius: 2px;
+}
+mark.current {
+  outline: 2px solid #c88c19;
+}
+.empty {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  text-align: center;
+  color: #6d837d;
+}
+.empty h2 {
+  color: #28413c;
+  margin: 18px 0 4px;
+  font-size: 22px;
+}
+.notice {
+  color: #718780;
+  line-height: 1.5;
+}
+.error {
+  color: #a23434;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+@media (max-width: 700px) {
+  header {
+    padding: 0 16px;
+  }
+  main {
+    height: auto;
+    display: block;
+  }
+  aside {
+    border-right: 0;
+    border-bottom: 1px solid #e5eeeb;
+    max-height: 48vh;
+  }
+  .reader {
+    padding: 28px 20px;
+    min-height: 50vh;
+  }
+  .reader-top {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .actions {
+    flex-wrap: wrap;
+  }
+  h2 {
+    font-size: 23px;
+  }
+}

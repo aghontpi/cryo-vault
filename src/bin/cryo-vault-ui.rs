@@ -95,17 +95,22 @@ fn handle(mut stream: TcpStream, db: &Path, port: u16, token: &str) -> Result<()
         "/" => (
             200,
             "text/html; charset=utf-8",
-            include_bytes!("../../ui/index.html").to_vec(),
+            include_bytes!("../ui/index.html").to_vec(),
         ),
         "/style.css" => (
             200,
             "text/css; charset=utf-8",
-            include_bytes!("../../ui/style.css").to_vec(),
+            include_bytes!("../ui/style.css").to_vec(),
         ),
         "/app.js" => (
             200,
             "text/javascript; charset=utf-8",
-            include_bytes!("../../ui/app.js").to_vec(),
+            include_bytes!("../ui/app.js").to_vec(),
+        ),
+        "/search.mjs" => (
+            200,
+            "text/javascript; charset=utf-8",
+            include_bytes!("../ui/search.mjs").to_vec(),
         ),
         p if p.starts_with("/api/") => {
             if headers.get("x-cryo-token").map(String::as_str) != Some(token) {
@@ -382,7 +387,7 @@ mod tests {
             "a/b+c"
         );
         assert!(parse_query("id=%zz").is_err());
-        let js = include_str!("../../ui/app.js");
+        let js = include_str!("../ui/app.js");
         assert!(!js.contains("innerHTML"));
         assert!(js.contains("textContent"));
     }
@@ -394,24 +399,27 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let path = dir.path().to_owned();
         let worker = std::thread::spawn(move || {
-            for s in listener.incoming().take(3) {
+            for s in listener.incoming().take(4) {
                 handle(s.unwrap(), &path, port, "secret").unwrap();
             }
         });
-        let request = |host: &str, token: &str| {
+        let request = |host: &str, token: &str, origin: &str| {
             let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
             write!(
                 s,
-                "GET /api/stats HTTP/1.1\r\nHost: {host}\r\nX-Cryo-Token: {token}\r\n\r\n"
+                "GET /api/stats HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nX-Cryo-Token: {token}\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
             s.read_to_string(&mut response).unwrap();
             response
         };
-        assert!(request(&format!("127.0.0.1:{port}"), "wrong").starts_with("HTTP/1.1 403"));
-        assert!(request("evil.example", "secret").starts_with("HTTP/1.1 403"));
-        assert!(request(&format!("127.0.0.1:{port}"), "secret").starts_with("HTTP/1.1 200"));
+        let host = format!("127.0.0.1:{port}");
+        let origin = format!("http://{host}");
+        assert!(request(&host, "wrong", &origin).starts_with("HTTP/1.1 403"));
+        assert!(request("evil.example", "secret", &origin).starts_with("HTTP/1.1 403"));
+        assert!(request(&host, "secret", "https://evil.example").starts_with("HTTP/1.1 403"));
+        assert!(request(&host, "secret", &origin).starts_with("HTTP/1.1 200"));
         worker.join().unwrap();
     }
 }

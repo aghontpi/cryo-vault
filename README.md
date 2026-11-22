@@ -125,6 +125,11 @@ filters, conversation details, find-in-conversation, and code blocks. Search
 scans the archive and can take longer on large archives. The separate viewer
 binary is currently built from source and is not yet included in release assets.
 
+The embedded interface sources live in `src/ui/`; no frontend framework or
+package installation is needed. To run the JavaScript search tests during
+development, use `node --test tests/ui_search.test.mjs` (Node.js is needed for
+the tests, not for the viewer).
+
 The binaries are `target/release/cryo-vault` and
 `target/release/cryo-vault-mcp`. When using a build directly, either invoke the
 explicit path or create an alias:
