@@ -69,6 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
       - run: cargo test
+      - run: node --test tests/ui_search.test.mjs
       - run: ./scripts/capture-smoke-test.sh
 
   build:

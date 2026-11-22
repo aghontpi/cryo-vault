@@ -19,6 +19,8 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test
+      - name: Test viewer search
+        run: node --test tests/ui_search.test.mjs
       - name: Run capture smoke test
         run: ./scripts/capture-smoke-test.sh
 
