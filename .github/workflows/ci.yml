@@ -30,14 +30,14 @@ jobs:
       matrix:
         include:
           - label: macOS arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             platform: macos
             arch: arm64
             extension: ''
             builder: cargo
           - label: macOS x64
-            runner: macos-14
+            runner: macos-15
             target: x86_64-apple-darwin
             platform: macos
             arch: x64
@@ -80,9 +80,11 @@ jobs:
       - name: Install Zig
         if: matrix.builder == 'zig'
         uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.1
       - name: Install cargo-zigbuild
         if: matrix.builder == 'zig'
-        run: cargo install cargo-zigbuild --locked
+        run: cargo install cargo-zigbuild --version 0.22.1 --locked
       - name: Build release binaries
         shell: bash
         run: |
