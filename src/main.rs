@@ -888,15 +888,23 @@ fn handle_capture(db_path: PathBuf, command: CaptureCommands) -> Result<()> {
                     if dry_run { " (dry-run)" } else { "" }
                 );
                 if report.skipped_unstable > 0 {
-                    println!(
-                        "{} file(s) await a second unchanged observation; the next unchanged run will import them.",
-                        report.skipped_unstable
-                    );
+                    if dry_run {
+                        println!(
+                            "{} file(s) need an unchanged second observation; dry runs do not save observations.",
+                            report.skipped_unstable
+                        );
+                    } else {
+                        println!(
+                            "{} file(s) await a second unchanged observation; the next unchanged run will process them.",
+                            report.skipped_unstable
+                        );
+                    }
                     println!("Re-run: {}", capture_rerun_command(platform));
                     println!("Use --verbose to see candidate paths and reasons.");
                 }
                 println!(
-                    "Capture wrote {} logical session(s). Inspect with: cryo last --source {}",
+                    "Capture {} {} logical session(s). Inspect with: cryo last --source {}",
+                    if dry_run { "would write" } else { "wrote" },
                     report.imported_sessions,
                     if platform == Platform::All {
                         "<platform>"

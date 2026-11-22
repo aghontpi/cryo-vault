@@ -425,10 +425,11 @@ fn run_once(
                 &mut report,
                 &candidate,
                 "awaiting second observation",
-                Some(
+                Some(if options.dry_run {
+                    "first observation would be recorded by a real run; dry run does not save it"
+                } else {
                     "first observation recorded; waiting for an unchanged second observation"
-                        .to_string(),
-                ),
+                }.to_string()),
                 pass,
                 observer,
             );

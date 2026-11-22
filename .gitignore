@@ -90,3 +90,5 @@ tests/tmp/
 
 dist/
 prebuilt/
+
+.plan/*

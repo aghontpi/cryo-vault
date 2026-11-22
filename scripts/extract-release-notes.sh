@@ -8,7 +8,7 @@ if [[ $# -ne 1 || ! "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 version="${1#v}"
-changelog="CHANGELOG.md"
+changelog="changelog/changelog.md"
 
 if [[ ! -f "$changelog" ]]; then
     echo "Missing $changelog" >&2
