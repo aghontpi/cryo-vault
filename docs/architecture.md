@@ -7,9 +7,9 @@ maintainers need to understand.
 
 ## System overview
 
-Cryo Vault is a local CLI, MCP server, and scheduled transcript collector
-sharing one database directory. The collector discovers supported coding-agent
-transcripts, extracts visible conversation turns, normalizes them into
+Cryo Vault is a local CLI, MCP server, scheduled transcript collector, and
+optional browser viewer sharing one database directory. The collector discovers
+supported coding-agent transcripts, extracts visible conversation turns, normalizes them into
 `ChatSessionV1`, and appends them to the archive. The CLI and MCP server can
 also ingest explicit JSON or ChatGPT exports.
 
@@ -43,6 +43,7 @@ available diagrams are listed in the [diagram index](#diagram-index).
 | Platform parser | Conversion of one supported source format into visible `ChatSessionV1` sessions and extraction metrics | Raw source retention |
 | Storage | WAL replay, segment append, indexes, compression, rotation, and logical visibility | Remote sync or cloud storage |
 | CLI / MCP readers | Search, show, browse, stats, provenance inspection, and explicit imports | Changing client transcripts |
+| Browser viewer | Local read-only browsing, search, metadata, and archive statistics through `cryo-vault-ui` | Archive mutations, transcript capture, or MCP server requests |
 
 ## Supported inputs
 
@@ -173,6 +174,28 @@ sessions while also reporting physical compressed and uncompressed bytes, so
 superseded revisions can continue to occupy disk until compaction. `reindex`
 rebuilds each segment's index atomically and returns the logical visible count.
 
+### Local browser viewer
+
+`cryo-vault-ui` is a separate executable that embeds its browser assets and
+serves them over HTTP on IPv4 loopback. It prints a URL with a fresh per-launch
+token in the fragment. The browser stores that token in session storage and
+sends it in the `X-Cryo-Token` header for archive API requests. The server also
+checks the host and any supplied origin; archive responses are not cached.
+
+The viewer calls the Rust storage library directly; it does not start or call
+the MCP server. Its read-only endpoints provide session summaries, session
+details, source names, and statistics. Each API request acquires the existing
+database lock before reading; acquiring it can create the lock file, but the
+viewer does not modify conversation records. Session browsing and title or
+message search scan the archive, apply source and UTC date filters, sort by
+session timestamp, and return pages of 50 summaries. Session details use the
+existing ID lookup. The browser renders message text as text, with fenced code
+blocks displayed separately.
+
+The viewer can be built from source. Future release builds include its separate
+executable; existing releases are unchanged. It requires an existing archive
+directory and a running local process.
+
 ## Operational lifecycle
 
 The platform installer enables a local 23:00 job unless `--no-capture` or
@@ -187,7 +210,7 @@ entries. It retains the archive, capture state, and unrelated client
 configuration. Removing archived data is a separate, user-confirmed operation:
 verify the exact configured `--db` / `CRYO_DB_PATH` path before deleting it.
 
-The automatic collector and all CLI/MCP operations are local-only. Transcript
+The automatic collector, CLI, MCP server, and viewer are local-only. Transcript
 bodies are read from the local profile and written to the configured local
 database; diagnostics expose paths, classifications, counters, and extraction
 metadata, never transcript message text.
@@ -196,6 +219,7 @@ metadata, never transcript message text.
 
 - [CLI and capture runbook](../README.md#automatic-capture-runbook)
 - [MCP usage](../README.md#mcp-server)
+- [Local viewer usage](../README.md#local-conversation-viewer)
 - [Store-conversations skill](../Skills/store-conversations/SKILL.md)
 - [Auto-capture skill](../Skills/auto-capture/SKILL.md)
 - [Capture smoke test](../scripts/capture-smoke-test.sh)
@@ -209,8 +233,8 @@ PlantUML source in PNG metadata. The diagrams cover:
 
 - [capture lifecycle](diagrams/capture-lifecycle.png) — automatic discovery,
   hints, eligibility, deduplication, parsing, provenance, storage, and reads;
-- [architecture overview](diagrams/architecture-overview.png) — manual CLI,
-  MCP, capture, storage, and retrieval relationships;
+- [architecture overview](diagrams/architecture-overview.png) — browser viewer,
+  manual CLI, MCP, capture, storage, and retrieval relationships;
 - [imports](diagrams/import_standard.png),
   [ChatGPT import](diagrams/import_chatgpt.png), and
   [streaming import](diagrams/import_stream.png);

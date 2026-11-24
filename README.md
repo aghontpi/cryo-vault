@@ -101,6 +101,37 @@ Confirm the installation with `cryo --help`.
 cargo build --release
 ```
 
+### Local conversation viewer
+
+CryoVault includes a separate, read-only browser viewer. Build and launch it
+from the repository:
+
+```bash
+cargo run --release --bin cryo-vault-ui
+```
+
+Open the complete URL printed in the terminal, including its `#` fragment.
+Press Ctrl+C in that terminal to stop the viewer. The viewer binds only to
+`127.0.0.1`, generates a fresh access token at startup, and embeds its web
+assets in the binary; it does not require Node.js or a separate web server.
+Keep the printed URL private while the viewer is running.
+
+The default archive is `~/.cryo`. To select another directory or a fixed
+loopback port, use `--db /path/to/archive` and `--port 8765`, or set
+`CRYO_DB_PATH`. The archive directory must already exist. The viewer does not
+change conversations; it uses the existing database lock file to coordinate
+reads with writers. It supports title and message search, source and UTC date
+filters, conversation details, find-in-conversation, and code blocks. Search
+scans the archive and can take longer on large archives. Future release builds
+include the separate viewer executable; existing releases are unchanged. The
+current installer does not install the viewer, so download and run the matching
+viewer asset directly when it becomes available.
+
+The embedded interface sources live in `src/ui/`; no frontend framework or
+package installation is needed. To run the JavaScript search tests during
+development, use `node --test tests/ui_search.test.mjs` (Node.js is needed for
+the tests, not for the viewer).
+
 The binaries are `target/release/cryo-vault` and
 `target/release/cryo-vault-mcp`. When using a build directly, either invoke the
 explicit path or create an alias:

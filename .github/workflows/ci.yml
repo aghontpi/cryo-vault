@@ -19,6 +19,8 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test
+      - name: Test viewer search
+        run: node --test tests/ui_search.test.mjs
       - name: Run capture smoke test
         run: ./scripts/capture-smoke-test.sh
 
@@ -30,14 +32,14 @@ jobs:
       matrix:
         include:
           - label: macOS arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             platform: macos
             arch: arm64
             extension: ''
             builder: cargo
           - label: macOS x64
-            runner: macos-14
+            runner: macos-15
             target: x86_64-apple-darwin
             platform: macos
             arch: x64
@@ -74,15 +76,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
       - name: Install Zig
         if: matrix.builder == 'zig'
         uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.1
       - name: Install cargo-zigbuild
         if: matrix.builder == 'zig'
-        run: cargo install cargo-zigbuild --locked
+        run: cargo install cargo-zigbuild --version 0.23.4 --locked
       - name: Build release binaries
         shell: bash
         run: |
@@ -94,6 +98,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
           cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/cryo-vault-ui${{ matrix.extension }}" "dist/cryo-vault-ui-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
       - name: Upload release artifacts
         id: upload_artifacts
         uses: actions/upload-artifact@v4

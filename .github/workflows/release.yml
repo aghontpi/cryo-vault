@@ -69,6 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
       - run: cargo test
+      - run: node --test tests/ui_search.test.mjs
       - run: ./scripts/capture-smoke-test.sh
 
   build:
@@ -79,14 +80,14 @@ jobs:
       matrix:
         include:
           - label: macOS arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             platform: macos
             arch: arm64
             extension: ''
             builder: cargo
           - label: macOS x64
-            runner: macos-14
+            runner: macos-15
             target: x86_64-apple-darwin
             platform: macos
             arch: x64
@@ -125,15 +126,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
       - name: Install Zig
         if: matrix.builder == 'zig'
         uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.1
       - name: Install cargo-zigbuild
         if: matrix.builder == 'zig'
-        run: cargo install cargo-zigbuild --locked
+        run: cargo install cargo-zigbuild --version 0.23.4 --locked
       - name: Build release binaries
         shell: bash
         run: |
@@ -147,6 +150,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-v$version-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
           cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-v$version-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/cryo-vault-ui${{ matrix.extension }}" "dist/cryo-vault-ui-v$version-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
       - name: Upload release artifacts
         id: upload_artifacts
         uses: actions/upload-artifact@v4
@@ -252,12 +256,25 @@ jobs:
             name="$(basename "$asset")"
             [[ "$asset" == "dist/$name" ]] || cp "$asset" "dist/$name"
           done < <(find dist -type f -name 'cryo-vault-*' -print0)
-          mapfile -t binaries < <(find dist -maxdepth 1 -type f -name 'cryo-vault-*' -print)
-          if [[ "${#binaries[@]}" -ne 12 ]]; then
-            echo "Expected 12 release binaries in dist; found ${#binaries[@]}." >&2
+          binary_count="$(find dist -maxdepth 1 -type f -name 'cryo-vault-*' -print | wc -l | tr -d '[:space:]')"
+          if [[ "$binary_count" -ne 18 ]]; then
+            echo "Expected 18 release binaries in dist; found $binary_count." >&2
             find dist -maxdepth 3 -type f -print >&2
             exit 1
           fi
+          for platform in macos linux windows; do
+            extension=''
+            [[ "$platform" == windows ]] && extension='.exe'
+            for arch in x64 arm64; do
+              for binary in cryo-vault cryo-vault-mcp cryo-vault-ui; do
+                expected="dist/$binary-${{ inputs.tag }}-$platform-$arch$extension"
+                if [[ ! -f "$expected" ]]; then
+                  echo "Missing release asset: $expected" >&2
+                  exit 1
+                fi
+              done
+            done
+          done
       - name: Verify and publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
