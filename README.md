@@ -122,8 +122,10 @@ loopback port, use `--db /path/to/archive` and `--port 8765`, or set
 change conversations; it uses the existing database lock file to coordinate
 reads with writers. It supports title and message search, source and UTC date
 filters, conversation details, find-in-conversation, and code blocks. Search
-scans the archive and can take longer on large archives. The separate viewer
-binary is currently built from source and is not yet included in release assets.
+scans the archive and can take longer on large archives. Future release builds
+include the separate viewer executable; existing releases are unchanged. The
+current installer does not install the viewer, so download and run the matching
+viewer asset directly when it becomes available.
 
 The embedded interface sources live in `src/ui/`; no frontend framework or
 package installation is needed. To run the JavaScript search tests during

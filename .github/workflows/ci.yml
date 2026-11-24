@@ -98,6 +98,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/cryo-vault${{ matrix.extension }}" "dist/cryo-vault-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
           cp "target/${{ matrix.target }}/release/cryo-vault-mcp${{ matrix.extension }}" "dist/cryo-vault-mcp-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/cryo-vault-ui${{ matrix.extension }}" "dist/cryo-vault-ui-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.extension }}"
       - name: Upload release artifacts
         id: upload_artifacts
         uses: actions/upload-artifact@v4

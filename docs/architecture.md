@@ -192,8 +192,9 @@ session timestamp, and return pages of 50 summaries. Session details use the
 existing ID lookup. The browser renders message text as text, with fenced code
 blocks displayed separately.
 
-The viewer is currently built from source and is not included in release
-assets. It requires an existing archive directory and a running local process.
+The viewer can be built from source. Future release builds include its separate
+executable; existing releases are unchanged. It requires an existing archive
+directory and a running local process.
 
 ## Operational lifecycle
 
